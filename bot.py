@@ -65,21 +65,16 @@ log = setup_logger()
 # 📡  FETCH CANDLES — Binance REST API
 # Ambil data OHLCV langsung dari Binance tanpa WebSocket/CCXT
 # ============================================================
-def fetch_candles(limit: int = 60) -> list | None:
-    """
-    Fetches closed OHLCV candles from Binance REST API.
-    Returns list of [timestamp, open, high, low, close, volume].
-    Mengembalikan list candle yang sudah closed dari Binance.
-    """
+def fetch_candles(limit: int = 100) -> list | None:
     try:
         resp = requests.get(
             BINANCE_KLINES_URL,
             params={
                 "symbol":   SYMBOL,
                 "interval": TIMEFRAME,
-                "limit":    limit + 1,  # +1 karena candle terakhir belum closed
+                "limit":    limit + 1,
             },
-            timeout=10,
+            timeout=15,
         )
         resp.raise_for_status()
         raw = resp.json()
@@ -288,12 +283,12 @@ def run_bot() -> None:
     while True:
         try:
             # ─── Fetch candles dari Binance REST API ──────────────────────────
-            candles = fetch_candles(limit=SNR_LOOKBACK + 5)
+            candles = fetch_candles(limit=SNR_LOOKBACK + 10)
 
-            if candles is None or len(candles) < SNR_LOOKBACK + 1:
-                log.warning("⚠️  Data candle tidak cukup, retry dalam 10s...")
-                time.sleep(10)
-                continue
+            if candles is None or len(candles) < SNR_LOOKBACK:
+    log.warning(f"⚠️  Data candle tidak cukup ({len(candles) if candles else 0}), retry dalam 30s...")
+    time.sleep(30)
+    continue
 
             # ─── Candle paling terakhir = candle yang baru saja closed ────────
             closed_candle = candles[-1]
