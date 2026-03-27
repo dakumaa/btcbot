@@ -33,7 +33,7 @@ TIMEFRAME          = "5m"
 SNR_LOOKBACK       = 30
 SNR_PEAK_DIST      = 4
 LOG_FILE           = "btc_notifier.log"
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
 
 # ============================================================
 # 📋  LOGGING SETUP
