@@ -10,7 +10,6 @@ import os
 import time
 from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -29,13 +28,11 @@ WICK_MULTIPLIER = float(os.getenv("WICK_MULTIPLIER", "2.5"))
 WICK_RATIO      = float(os.getenv("WICK_RATIO",      "0.70"))
 SNR_TOLERANCE   = float(os.getenv("SNR_TOLERANCE",   "0.0020"))
 
-SYMBOL          = "BTCUSDT"
-TIMEFRAME       = "5m"
-SNR_LOOKBACK    = 30
-SNR_PEAK_DIST   = 4
-LOG_FILE        = "btc_notifier.log"
-
-# Binance REST API — tidak butuh API key untuk data publik
+SYMBOL             = "BTCUSDT"
+TIMEFRAME          = "5m"
+SNR_LOOKBACK       = 30
+SNR_PEAK_DIST      = 4
+LOG_FILE           = "btc_notifier.log"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 # ============================================================
@@ -63,9 +60,12 @@ log = setup_logger()
 
 # ============================================================
 # 📡  FETCH CANDLES — Binance REST API
-# Ambil data OHLCV langsung dari Binance tanpa WebSocket/CCXT
 # ============================================================
-def fetch_candles(limit: int = 100) -> list | None:
+def fetch_candles(limit: int = 100) -> list:
+    """
+    Fetch closed OHLCV candles dari Binance REST API.
+    Candle terakhir (yang masih berjalan) dibuang otomatis.
+    """
     try:
         resp = requests.get(
             BINANCE_KLINES_URL,
@@ -79,29 +79,27 @@ def fetch_candles(limit: int = 100) -> list | None:
         resp.raise_for_status()
         raw = resp.json()
 
-        # Konversi ke format [ts, open, high, low, close, volume]
         candles = [
             [
-                int(row[0]),        # timestamp (ms)
-                float(row[1]),      # open
-                float(row[2]),      # high
-                float(row[3]),      # low
-                float(row[4]),      # close
-                float(row[5]),      # volume
+                int(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5]),
             ]
             for row in raw
         ]
 
-        # Buang candle terakhir (masih berjalan / belum closed)
+        # Buang candle terakhir (belum closed)
         return candles[:-1]
 
     except requests.exceptions.RequestException as e:
-        log.error(f"❌ Gagal fetch candles dari Binance: {e}")
-        return None
+        log.error(f"❌ Gagal fetch candles: {e}")
+        return []
 
 # ============================================================
 # 📊  WICK / PINBAR DETECTION
-# Deteksi pola ekor panjang (pinbar) dari satu candle OHLC
 # ============================================================
 def analyze_candle(o: float, h: float, l: float, c: float) -> dict:
     body         = abs(c - o)
@@ -118,13 +116,10 @@ def analyze_candle(o: float, h: float, l: float, c: float) -> dict:
     signal      = None
 
     # 🐂 Bullish — Ekor bawah panjang
-    if (lower_wick >= WICK_MULTIPLIER * body_safe and
-            lower_ratio >= WICK_RATIO):
+    if lower_wick >= WICK_MULTIPLIER * body_safe and lower_ratio >= WICK_RATIO:
         signal = "BULLISH"
-
     # 🐻 Bearish — Ekor atas panjang
-    elif (upper_wick >= WICK_MULTIPLIER * body_safe and
-              upper_ratio >= WICK_RATIO):
+    elif upper_wick >= WICK_MULTIPLIER * body_safe and upper_ratio >= WICK_RATIO:
         signal = "BEARISH"
 
     return {
@@ -248,22 +243,16 @@ def build_message(
     )
 
 # ============================================================
-# ⏱️  HITUNG WAKTU TUNGGU KE PENUTUPAN CANDLE BERIKUTNYA
-# Agar bot selalu mengecek tepat setelah candle 5m tertutup
+# ⏱️  HITUNG WAKTU TUNGGU KE CANDLE BERIKUTNYA
 # ============================================================
 def seconds_until_next_candle(interval_seconds: int = 300) -> float:
-    """
-    Menghitung berapa detik lagi sampai candle 5m berikutnya tertutup.
-    Bot akan sleep sampai tepat di awal candle baru (+ 2 detik buffer).
-    """
     now       = time.time()
     elapsed   = now % interval_seconds
     remaining = interval_seconds - elapsed
-    return remaining + 2  # +2 detik buffer agar candle sudah pasti closed
+    return remaining + 2  # +2 detik buffer
 
 # ============================================================
-# 🤖  MAIN BOT LOOP — REST API Polling
-# Cek setiap kali candle 5m baru tertutup
+# 🤖  MAIN BOT LOOP
 # ============================================================
 def run_bot() -> None:
     log.info("🚀 BTC 5m Notifier Bot AKTIF (Binance REST | Strict SNR Mode)")
@@ -275,26 +264,29 @@ def run_bot() -> None:
 
     last_processed_ts = None
 
-    # Tunggu sampai candle pertama tertutup sebelum mulai loop
+    # Tunggu sampai candle pertama tertutup
     wait = seconds_until_next_candle()
-    log.info(f"⏳ Menunggu candle 5m berikutnya tertutup dalam {wait:.0f} detik...")
+    log.info(f"⏳ Menunggu candle 5m berikutnya dalam {wait:.0f} detik...")
     time.sleep(wait)
 
     while True:
         try:
-            # ─── Fetch candles dari Binance REST API ──────────────────────────
+            # ─── Fetch candles ─────────────────────────────────────────────────
             candles = fetch_candles(limit=SNR_LOOKBACK + 10)
 
-            if candles is None or len(candles) < SNR_LOOKBACK:
-    log.warning(f"⚠️  Data candle tidak cukup ({len(candles) if candles else 0}), retry dalam 30s...")
-    time.sleep(30)
-    continue
+            if not candles or len(candles) < SNR_LOOKBACK:
+                log.warning(
+                    f"⚠️  Data candle tidak cukup "
+                    f"({len(candles) if candles else 0}/{SNR_LOOKBACK}), "
+                    f"retry dalam 30s..."
+                )
+                time.sleep(30)
+                continue
 
-            # ─── Candle paling terakhir = candle yang baru saja closed ────────
+            # ─── Ambil candle yang baru closed ─────────────────────────────────
             closed_candle = candles[-1]
             candle_ts     = closed_candle[0]
 
-            # Skip jika candle ini sudah diproses sebelumnya
             if candle_ts == last_processed_ts:
                 log.debug("  ↳ Candle sudah diproses. Menunggu candle baru...")
                 time.sleep(10)
@@ -302,29 +294,43 @@ def run_bot() -> None:
 
             last_processed_ts = candle_ts
             ts, o, h, l, c, v = closed_candle
-            dt_str = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-            log.info(f"📈 Candle closed [{dt_str} UTC] | O:{o:.2f} H:{h:.2f} L:{l:.2f} C:{c:.2f}")
+            dt_str = datetime.fromtimestamp(
+                ts / 1000, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M")
+            log.info(
+                f"📈 Candle closed [{dt_str} UTC] | "
+                f"O:{o:.2f} H:{h:.2f} L:{l:.2f} C:{c:.2f}"
+            )
 
-            # ─── Step 1: Deteksi wick / pinbar ────────────────────────────────
+            # ─── Step 1: Deteksi wick ──────────────────────────────────────────
             wick = analyze_candle(o, h, l, c)
+
             if wick["signal"] is None:
                 log.info("  ↳ Tidak ada sinyal wick. Menunggu candle berikutnya.")
             else:
                 log.info(f"  ↳ 🕯️  Wick terdeteksi: {wick['signal']}!")
 
-                # ─── Step 2: Deteksi S/R ──────────────────────────────────────
+                # ─── Step 2: Deteksi S/R ───────────────────────────────────────
                 snr = detect_snr(candles)
-                log.debug(f"  ↳ Supports: {snr['supports'][-3:]} | Resistances: {snr['resistances'][-3:]}")
+                log.debug(
+                    f"  ↳ Supports: {snr['supports'][-3:]} | "
+                    f"Resistances: {snr['resistances'][-3:]}"
+                )
 
-                # ─── Step 3: Cek SNR confluence ───────────────────────────────
-                nearest_level, level_type = find_nearest_snr(c, wick["signal"], snr)
+                # ─── Step 3: Cek SNR confluence ────────────────────────────────
+                nearest_level, level_type = find_nearest_snr(
+                    c, wick["signal"], snr
+                )
 
                 if nearest_level is None:
                     log.info("  ↳ ❌ SNR filter TIDAK lolos — tidak dekat S/R. Skip.")
                 else:
-                    log.info(f"  ↳ ✅ SNR confluence! Dekat {level_type}: ${nearest_level:,.2f}")
+                    log.info(
+                        f"  ↳ ✅ SNR confluence! "
+                        f"Dekat {level_type}: ${nearest_level:,.2f}"
+                    )
 
-                    # ─── Step 4: Kirim notifikasi Telegram ────────────────────
+                    # ─── Step 4: Kirim Telegram ────────────────────────────────
                     message = build_message(
                         signal        = wick["signal"],
                         candle        = closed_candle,
@@ -335,13 +341,13 @@ def run_bot() -> None:
                     log.info("  ↳ 📨 Mengirim notifikasi Telegram...")
                     send_telegram(message)
 
-            # ─── Tunggu sampai candle 5m berikutnya tertutup ──────────────────
+            # ─── Tunggu candle berikutnya ──────────────────────────────────────
             wait = seconds_until_next_candle()
             log.info(f"⏳ Candle berikutnya dalam {wait:.0f} detik...")
             time.sleep(wait)
 
         except KeyboardInterrupt:
-            log.info("🛑 Bot dihentikan oleh user. Sampai jumpa! 👋")
+            log.info("🛑 Bot dihentikan. Sampai jumpa! 👋")
             break
 
         except Exception as e:
