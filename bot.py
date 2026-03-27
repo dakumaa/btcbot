@@ -3,6 +3,7 @@
 # Strategi: Teori Ekor (Pinbar Rejection) + Dynamic SNR Filter
 # Mode: VERY STRICT | Timeframe: FIXED 5m BTCUSDT
 # Data Source: Binance REST API (polling — tanpa WebSocket/CCXT)
+# Fitur: Signal Result Tracker (Benar/Salah otomatis)
 # ============================================================
 
 import logging
@@ -204,9 +205,9 @@ def get_polymarket_link(unix_ts: float) -> str:
     return f"https://polymarket.com/event/btc-updown-5m-{window_ts}"
 
 # ============================================================
-# 🏗️  BUILD NOTIFICATION MESSAGE
+# 🏗️  BUILD SIGNAL MESSAGE
 # ============================================================
-def build_message(
+def build_signal_message(
     signal:        str,
     candle:        list,
     wick_data:     dict,
@@ -236,10 +237,69 @@ def build_message(
         f"L: <code>{l:,.2f}</code>  C: <code>{c:,.2f}</code>\n"
         f"📏 {wick_label}: <b>{wick_pct}</b>\n"
         f"📌 {snr_line}\n"
-        f"💰 Current BTC : <b>${c:,.2f}</b>\n"
+        f"💰 Entry BTC  : <b>${c:,.2f}</b>\n"
         f"🔗 Polymarket 5m: <a href='{poly_link}'>Open Market</a>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <i>Notifier only. DYOR. Not financial advice.</i>"
+        f"⏳ <i>Menunggu hasil candle berikutnya...</i>"
+    )
+
+# ============================================================
+# 📊  BUILD RESULT MESSAGE
+# Kirim hasil sinyal setelah candle berikutnya tertutup
+# Format: Benar/Salah + detail pergerakan harga
+# ============================================================
+def build_result_message(
+    signal:       str,
+    entry_price:  float,
+    entry_time:   str,
+    result_candle: list,
+) -> str:
+    """
+    Membandingkan harga entry dengan close candle berikutnya.
+    BULLISH benar jika close > entry (harga naik).
+    BEARISH benar jika close < entry (harga turun).
+    """
+    ts, o, h, l, c, _ = result_candle
+    dt_str     = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    price_diff = c - entry_price
+    pct_change = (price_diff / entry_price) * 100
+
+    # ─── Tentukan apakah sinyal BENAR atau SALAH ──────────────────────────────
+    if signal == "BULLISH":
+        is_correct = c > entry_price
+        direction  = "⬆️ Naik" if price_diff > 0 else "⬇️ Turun"
+    else:
+        is_correct = c < entry_price
+        direction  = "⬇️ Turun" if price_diff < 0 else "⬆️ Naik"
+
+    if is_correct:
+        verdict      = "✅ <b>BENAR</b>"
+        verdict_desc = "Prediksi tepat! Harga bergerak sesuai sinyal."
+        emoji        = "🎯"
+    else:
+        verdict      = "❌ <b>SALAH</b>"
+        verdict_desc = "Prediksi meleset. Harga bergerak berlawanan."
+        emoji        = "💔"
+
+    diff_sign = "+" if price_diff > 0 else ""
+
+    return (
+        f"{emoji} <b>HASIL SINYAL — {verdict}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 Sinyal Awal : <b>{'🐂 BULLISH (UP)' if signal == 'BULLISH' else '🐻 BEARISH (DOWN)'}</b>\n"
+        f"⏰ Entry Time  : {entry_time} (UTC)\n"
+        f"💰 Entry Price : <b>${entry_price:,.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ Result Time : {dt_str} (UTC)\n"
+        f"📊 Result Candle:\n"
+        f"   O: <code>{o:,.2f}</code>  H: <code>{h:,.2f}</code>\n"
+        f"   L: <code>{l:,.2f}</code>  C: <code>{c:,.2f}</code>\n"
+        f"📈 Pergerakan  : {direction} "
+        f"<code>{diff_sign}{price_diff:,.2f}</code> "
+        f"(<code>{diff_sign}{pct_change:.3f}%</code>)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏁 Verdict     : {verdict}\n"
+        f"💬 <i>{verdict_desc}</i>"
     )
 
 # ============================================================
@@ -263,6 +323,11 @@ def run_bot() -> None:
     log.info("   Mode      : REST API Polling (tanpa WebSocket/CCXT)")
 
     last_processed_ts = None
+
+    # ─── Pending signal — menyimpan sinyal yang menunggu hasil ────────────────
+    # Format: {"signal": "BULLISH"/"BEARISH", "entry_price": float,
+    #          "entry_time": str, "entry_ts": int}
+    pending_signal = None
 
     # Tunggu sampai candle pertama tertutup
     wait = seconds_until_next_candle()
@@ -302,6 +367,38 @@ def run_bot() -> None:
                 f"O:{o:.2f} H:{h:.2f} L:{l:.2f} C:{c:.2f}"
             )
 
+            # ══════════════════════════════════════════════════════════════════
+            # 🏁 CEK HASIL SINYAL SEBELUMNYA (jika ada pending signal)
+            # Dilakukan SEBELUM analisa candle baru
+            # ══════════════════════════════════════════════════════════════════
+            if pending_signal is not None:
+                log.info(
+                    f"  ↳ 🏁 Ada pending signal {pending_signal['signal']} — "
+                    f"menghitung hasil..."
+                )
+                result_msg = build_result_message(
+                    signal        = pending_signal["signal"],
+                    entry_price   = pending_signal["entry_price"],
+                    entry_time    = pending_signal["entry_time"],
+                    result_candle = closed_candle,
+                )
+                send_telegram(result_msg)
+
+                # Tentukan verdict untuk log
+                if pending_signal["signal"] == "BULLISH":
+                    verdict_log = "BENAR ✅" if c > pending_signal["entry_price"] else "SALAH ❌"
+                else:
+                    verdict_log = "BENAR ✅" if c < pending_signal["entry_price"] else "SALAH ❌"
+
+                log.info(f"  ↳ Hasil sinyal: {verdict_log}")
+
+                # Reset pending signal setelah hasil dikirim
+                pending_signal = None
+
+            # ══════════════════════════════════════════════════════════════════
+            # 🕯️  ANALISA CANDLE BARU
+            # ══════════════════════════════════════════════════════════════════
+
             # ─── Step 1: Deteksi wick ──────────────────────────────────────────
             wick = analyze_candle(o, h, l, c)
 
@@ -330,16 +427,29 @@ def run_bot() -> None:
                         f"Dekat {level_type}: ${nearest_level:,.2f}"
                     )
 
-                    # ─── Step 4: Kirim Telegram ────────────────────────────────
-                    message = build_message(
+                    # ─── Step 4: Kirim notifikasi sinyal ──────────────────────
+                    signal_msg = build_signal_message(
                         signal        = wick["signal"],
                         candle        = closed_candle,
                         wick_data     = wick,
                         nearest_level = nearest_level,
                         level_type    = level_type,
                     )
-                    log.info("  ↳ 📨 Mengirim notifikasi Telegram...")
-                    send_telegram(message)
+                    log.info("  ↳ 📨 Mengirim sinyal ke Telegram...")
+                    send_telegram(signal_msg)
+
+                    # ─── Simpan pending signal untuk dicek hasilnya ────────────
+                    # Hasil akan dikirim pada candle berikutnya (5 menit kemudian)
+                    pending_signal = {
+                        "signal":      wick["signal"],
+                        "entry_price": c,
+                        "entry_time":  dt_str,
+                        "entry_ts":    ts,
+                    }
+                    log.info(
+                        f"  ↳ ⏳ Pending signal disimpan — "
+                        f"hasil akan dikirim di candle berikutnya."
+                    )
 
             # ─── Tunggu candle berikutnya ──────────────────────────────────────
             wait = seconds_until_next_candle()
