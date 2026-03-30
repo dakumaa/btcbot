@@ -36,7 +36,7 @@ COINS=[
     {"symbol":"XRPUSDT","name":"XRP","active":True},
     {"symbol":"DOGEUSDT","name":"DOGE","active":True},
     {"symbol":"BNBUSDT","name":"BNB","active":True},
-    {"symbol":"HYPEUSDT","name":"HYPE","active":True},
+    {"symbol":"HYPEUSDT","name":"HYPE","active":False},
 ]
 
 def setup_logger():
