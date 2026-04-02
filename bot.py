@@ -1,5 +1,5 @@
 # ============================================================
-# POLYMARKET 15M SIGNAL BOT v8
+# POLYMARKET 15M SIGNAL BOT v8.2
 # Fix v8: Harga referensi = Close candle 15M (bukan entry harga real-time)
 #         Ini sesuai cara Polymarket menentukan UP/DOWN:
 #         "Apakah harga AKHIR window > harga AWAL window?"
@@ -30,10 +30,10 @@ BACKTEST_MODE       = os.getenv("BACKTEST_MODE", "False").lower() == "true"
 
 WICK_RATIO_MIN      = float(os.getenv("WICK_RATIO_MIN",   "0.70"))
 FALSE_BREAK_MIN     = float(os.getenv("FALSE_BREAK_MIN",  "0.0015"))
-BODY_RATIO_MIN      = float(os.getenv("BODY_RATIO_MIN",   "0.55"))
-CLOSE_UPPER_MIN     = float(os.getenv("CLOSE_UPPER_MIN",  "0.70"))
-CLOSE_LOWER_MAX     = float(os.getenv("CLOSE_LOWER_MAX",  "0.30"))
-VOLUME_MULT         = float(os.getenv("VOLUME_MULT",      "1.3"))
+BODY_RATIO_MIN      = float(os.getenv("BODY_RATIO_MIN",   "0.45"))  # longgar 55%→45%
+CLOSE_UPPER_MIN     = float(os.getenv("CLOSE_UPPER_MIN",  "0.65"))  # longgar 70%→65%
+CLOSE_LOWER_MAX     = float(os.getenv("CLOSE_LOWER_MAX",  "0.35"))  # longgar 30%→35%
+VOLUME_MULT         = float(os.getenv("VOLUME_MULT",      "1.2"))   # longgar 1.3×→1.2×
 RSI_UP_MAX          = float(os.getenv("RSI_UP_MAX",       "52"))
 RSI_DOWN_MIN        = float(os.getenv("RSI_DOWN_MIN",     "48"))
 SNR_TOLERANCE       = float(os.getenv("SNR_TOLERANCE",    "0.003"))
@@ -43,6 +43,13 @@ HTF_STRICT          = os.getenv("HTF_STRICT", "False").lower() == "true"
 EMA_FAST            = 9
 EMA_SLOW            = 21
 HTF_INTERVAL        = "1h"
+
+# ── Candle Exhaustion (strategi baru) ────────────────────────────────────────
+# Setelah N candle berturut-turut satu warna → kemungkinan besar berbalik
+EXHAUSTION_MIN      = int(os.getenv("EXHAUSTION_MIN", "3"))    # min 3 candle searah
+EXHAUSTION_MAX      = int(os.getenv("EXHAUSTION_MAX", "5"))    # max 5 candle searah
+# True = wajib dekat S/R, False = boleh tanpa S/R (lebih banyak sinyal)
+EXHAUSTION_SNR_REQ  = os.getenv("EXHAUSTION_SNR_REQ", "False").lower() == "true"
 
 CONFIRM_WAIT_SEC    = int(os.getenv("CONFIRM_WAIT_SEC", "180"))
 CONFIRM_TF          = "1m"
@@ -262,44 +269,97 @@ def detect_pattern(symbol, candles):
     snr    = detect_snr(candles)
     result = None
 
-    # POLA 1: WICK
-    if lo_ratio >= WICK_RATIO_MIN:
+    # ══════════════════════════════════════════════════════════════════════════
+    # URUTAN PRIORITAS DETEKSI POLA:
+    # 1. MOMENTUM  — body kuat + volume tinggi (paling cepat dikonfirmasi)
+    # 2. EXHAUSTION — 3-5 candle warna sama → kemungkinan berbalik
+    # 3. WICK       — ekor panjang + dekat S/R
+    # 4. FALSE BREAK — spike tembus S/R lalu balik (paling jarang, paling kuat)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # POLA 1: MOMENTUM
+    if vol_ok:
+        if close > o and body_ratio >= BODY_RATIO_MIN and close_pos >= CLOSE_UPPER_MIN:
+            lvl, ltype = find_nearest_snr(close, "UP", snr)
+            result = {"signal":"UP","pattern":"MOMENTUM","wick_pct":None,"body_pct":body_ratio*100,
+                      "lvl":lvl,"lvl_type":ltype or "Support",
+                      "extra":f"Bullish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
+        elif close < o and body_ratio >= BODY_RATIO_MIN and close_pos <= CLOSE_LOWER_MAX:
+            lvl, ltype = find_nearest_snr(close, "DOWN", snr)
+            result = {"signal":"DOWN","pattern":"MOMENTUM","wick_pct":None,"body_pct":body_ratio*100,
+                      "lvl":lvl,"lvl_type":ltype or "Resistance",
+                      "extra":f"Bearish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
+
+    # POLA 2: EXHAUSTION (3-5 candle warna sama → prediksi balik arah)
+    if result is None:
+        lookback = candles[-(EXHAUSTION_MAX + 2):-1]
+
+        bearish_streak = 0
+        for prev_c in reversed(lookback):
+            if prev_c[4] < prev_c[1]:
+                bearish_streak += 1
+            else:
+                break
+
+        bullish_streak = 0
+        for prev_c in reversed(lookback):
+            if prev_c[4] >= prev_c[1]:
+                bullish_streak += 1
+            else:
+                break
+
+        if EXHAUSTION_MIN <= bearish_streak <= EXHAUSTION_MAX:
+            lvl, ltype = find_nearest_snr(close, "UP", snr)
+            if not EXHAUSTION_SNR_REQ or lvl is not None:
+                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else " (no S/R)"
+                result = {
+                    "signal":"UP","pattern":"EXHAUSTION",
+                    "wick_pct":None,"body_pct":None,
+                    "lvl":lvl,"lvl_type":ltype or "Support",
+                    "extra":f"{bearish_streak}🔴 berturut → potensi UP{snr_info}",
+                }
+        elif EXHAUSTION_MIN <= bullish_streak <= EXHAUSTION_MAX:
+            lvl, ltype = find_nearest_snr(close, "DOWN", snr)
+            if not EXHAUSTION_SNR_REQ or lvl is not None:
+                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else " (no S/R)"
+                result = {
+                    "signal":"DOWN","pattern":"EXHAUSTION",
+                    "wick_pct":None,"body_pct":None,
+                    "lvl":lvl,"lvl_type":ltype or "Resistance",
+                    "extra":f"{bullish_streak}🟢 berturut → potensi DOWN{snr_info}",
+                }
+
+    # POLA 3: WICK
+    if result is None and lo_ratio >= WICK_RATIO_MIN:
         lvl, ltype = find_nearest_snr(close, "UP", snr)
         if lvl is not None:
             result = {"signal":"UP","pattern":"WICK","wick_pct":lo_ratio*100,"body_pct":None,
-                      "lvl":lvl,"lvl_type":ltype,"extra":f"Lower Wick {lo_ratio*100:.1f}% + {ltype} ${lvl:.4f}"}
+                      "lvl":lvl,"lvl_type":ltype,
+                      "extra":f"Lower Wick {lo_ratio*100:.1f}% + {ltype} ${lvl:.4f}"}
     if result is None and up_ratio >= WICK_RATIO_MIN:
         lvl, ltype = find_nearest_snr(close, "DOWN", snr)
         if lvl is not None:
             result = {"signal":"DOWN","pattern":"WICK","wick_pct":up_ratio*100,"body_pct":None,
-                      "lvl":lvl,"lvl_type":ltype,"extra":f"Upper Wick {up_ratio*100:.1f}% + {ltype} ${lvl:.4f}"}
+                      "lvl":lvl,"lvl_type":ltype,
+                      "extra":f"Upper Wick {up_ratio*100:.1f}% + {ltype} ${lvl:.4f}"}
 
-    # POLA 2: FALSE BREAK
+    # POLA 4: FALSE BREAK
     if result is None:
         for sup in snr["supports"]:
             depth = (sup - l) / close
             if l < sup and close > sup and depth >= FALSE_BREAK_MIN:
                 result = {"signal":"UP","pattern":"FALSE_BREAK","wick_pct":None,"body_pct":None,
-                          "lvl":sup,"lvl_type":"Support","extra":f"False Break ↓{depth*100:.2f}% bawah ${sup:.4f}"}
+                          "lvl":sup,"lvl_type":"Support",
+                          "extra":f"False Break ↓{depth*100:.2f}% bawah ${sup:.4f}"}
                 break
     if result is None:
         for res in reversed(snr["resistances"]):
             depth = (h - res) / close
             if h > res and close < res and depth >= FALSE_BREAK_MIN:
                 result = {"signal":"DOWN","pattern":"FALSE_BREAK","wick_pct":None,"body_pct":None,
-                          "lvl":res,"lvl_type":"Resistance","extra":f"False Break ↑{depth*100:.2f}% atas ${res:.4f}"}
+                          "lvl":res,"lvl_type":"Resistance",
+                          "extra":f"False Break ↑{depth*100:.2f}% atas ${res:.4f}"}
                 break
-
-    # POLA 3: MOMENTUM
-    if result is None and vol_ok:
-        if close > o and body_ratio >= BODY_RATIO_MIN and close_pos >= CLOSE_UPPER_MIN:
-            lvl, ltype = find_nearest_snr(close, "UP", snr)
-            result = {"signal":"UP","pattern":"MOMENTUM","wick_pct":None,"body_pct":body_ratio*100,
-                      "lvl":lvl,"lvl_type":ltype or "Support","extra":f"Bullish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
-        elif close < o and body_ratio >= BODY_RATIO_MIN and close_pos <= CLOSE_LOWER_MAX:
-            lvl, ltype = find_nearest_snr(close, "DOWN", snr)
-            result = {"signal":"DOWN","pattern":"MOMENTUM","wick_pct":None,"body_pct":body_ratio*100,
-                      "lvl":lvl,"lvl_type":ltype or "Resistance","extra":f"Bearish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
 
     if result is None:
         return None
@@ -616,7 +676,7 @@ def build_daily_report(stats_pat, stats_coin):
     msg     += "━━━━━━━━━━━━━━━━━━━━━━\n"
     msg     += "\n📋 <b>Per Pola:</b>\n"
     tw, tl   = 0, 0
-    for pattern in ["WICK","FALSE_BREAK","MOMENTUM"]:
+    for pattern in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION"]:
         s     = stats_pat.get(pattern, {"win":0,"loss":0,"cancelled":0})
         total = s["win"] + s["loss"]
         wr    = (s["win"]/total*100) if total > 0 else 0
@@ -645,7 +705,7 @@ def build_weekly_report(stats_pat, stats_coin, days):
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += "\n📋 <b>Per Pola:</b>\n"
     tw, tl = 0, 0
-    for pattern in ["WICK","FALSE_BREAK","MOMENTUM"]:
+    for pattern in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION"]:
         s     = stats_pat.get(pattern, {"win":0,"loss":0,"cancelled":0})
         total = s["win"] + s["loss"]
         wr    = (s["win"]/total*100) if total > 0 else 0
@@ -697,9 +757,9 @@ def run_bot():
     log.info(f"   FIX v8     : Ref price = close candle 15M (acuan Polymarket)")
 
     pending_signals      = []
-    daily_stats_pat      = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM"]}
+    daily_stats_pat      = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION"]}
     daily_stats_coin     = {c["name"]:{"win":0,"loss":0} for c in COINS}
-    weekly_stats_pat     = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM"]}
+    weekly_stats_pat     = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION"]}
     weekly_stats_coin    = {c["name"]:{"win":0,"loss":0} for c in COINS}
     result_history       = defaultdict(list)
     last_processed       = {}
@@ -723,21 +783,21 @@ def run_bot():
                     log.info("📊 Daily report dikirim.")
 
                     weekly_day_count += 1
-                    for p in ["WICK","FALSE_BREAK","MOMENTUM"]:
+                    for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION"]:
                         for k in ["win","loss","cancelled"]:
                             weekly_stats_pat[p][k] += daily_stats_pat[p].get(k, 0)
                     for cn in daily_stats_coin:
                         for k in ["win","loss"]:
                             weekly_stats_coin[cn][k] += daily_stats_coin[cn].get(k, 0)
 
-                    daily_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM"]}
+                    daily_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION"]}
                     daily_stats_coin = {c["name"]:{"win":0,"loss":0} for c in COINS}
                     daily_report_sent = today_str
 
                     if weekly_day_count >= 7:
                         send_telegram(build_weekly_report(weekly_stats_pat, weekly_stats_coin, weekly_day_count))
                         log.info("📊 Weekly report dikirim.")
-                        weekly_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM"]}
+                        weekly_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION"]}
                         weekly_stats_coin = {c["name"]:{"win":0,"loss":0} for c in COINS}
                         weekly_day_count  = 0
 
