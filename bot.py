@@ -28,15 +28,15 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "your_chat_id_here")
 
 BACKTEST_MODE       = os.getenv("BACKTEST_MODE", "False").lower() == "true"
 
-WICK_RATIO_MIN      = float(os.getenv("WICK_RATIO_MIN",   "0.70"))
-FALSE_BREAK_MIN     = float(os.getenv("FALSE_BREAK_MIN",  "0.0015"))
-BODY_RATIO_MIN      = float(os.getenv("BODY_RATIO_MIN",   "0.45"))  # longgar 55%→45%
-CLOSE_UPPER_MIN     = float(os.getenv("CLOSE_UPPER_MIN",  "0.65"))  # longgar 70%→65%
-CLOSE_LOWER_MAX     = float(os.getenv("CLOSE_LOWER_MAX",  "0.35"))  # longgar 30%→35%
-VOLUME_MULT         = float(os.getenv("VOLUME_MULT",      "1.2"))   # longgar 1.3×→1.2×
-RSI_UP_MAX          = float(os.getenv("RSI_UP_MAX",       "52"))
-RSI_DOWN_MIN        = float(os.getenv("RSI_DOWN_MIN",     "48"))
-SNR_TOLERANCE       = float(os.getenv("SNR_TOLERANCE",    "0.003"))
+WICK_RATIO_MIN      = float(os.getenv("WICK_RATIO_MIN",   "0.75"))  # naik 70%→75%
+FALSE_BREAK_MIN     = float(os.getenv("FALSE_BREAK_MIN",  "0.0025")) # naik 0.15%→0.25%
+BODY_RATIO_MIN      = float(os.getenv("BODY_RATIO_MIN",   "0.60"))  # perketat →60%
+CLOSE_UPPER_MIN     = float(os.getenv("CLOSE_UPPER_MIN",  "0.75"))  # perketat →75%
+CLOSE_LOWER_MAX     = float(os.getenv("CLOSE_LOWER_MAX",  "0.25"))  # perketat →25%
+VOLUME_MULT         = float(os.getenv("VOLUME_MULT",      "1.8"))   # perketat →1.8×
+RSI_UP_MAX          = float(os.getenv("RSI_UP_MAX",       "45"))  # perketat 52→45
+RSI_DOWN_MIN        = float(os.getenv("RSI_DOWN_MIN",     "55"))  # perketat 48→55
+SNR_TOLERANCE       = float(os.getenv("SNR_TOLERANCE",    "0.002")) # perketat ±0.3%→±0.2%
 CANDLE_RANGE_MIN    = float(os.getenv("CANDLE_RANGE_MIN", "0.0015"))
 
 HTF_STRICT          = os.getenv("HTF_STRICT", "False").lower() == "true"
@@ -292,102 +292,119 @@ def detect_pattern(symbol, candles, coin_name="", exh_state=None):
                       "extra":f"Bearish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
 
     # ══════════════════════════════════════════════════════════════════════════
-    # POLA 2: EXHAUSTION — Logika Final
+    # POLA 2: EXHAUSTION — Logika Final v3
     #
-    # SINYAL diberikan saat ada tepat 3 atau 4 candle warna sama BERTURUT-TURUT
-    # (dihitung dari candle SEBELUM candle sinyal, tidak termasuk candle sinyal)
-    # dan candle sinyal sendiri BERLAWANAN warna (konfirmasi awal reversal).
+    # Sinyal dikirim saat candle SAAT INI membentuk streak ke-3 atau ke-4
+    # dengan warna SAMA berturut-turut.
     #
-    # Flow:
-    #   🟢🟢🟢 + 🔴(sinyal) → EXHAUSTION_3 DOWN
-    #     → BENAR  : reset streak
-    #     → SALAH  : candle ke-4 masih 🟢 → state = {GREEN, 3}
+    # 3🟢 berturut → notif "potensi DOWN"
+    #   → BENAR  (candle berikutnya turun) → streak reset
+    #   → SALAH  (candle berikutnya naik = jadi 4🟢) → signal lagi EXH-4
+    #     → EXH-4 BENAR/SALAH → selalu reset
     #
-    #   🟢🟢🟢🟢 + 🔴(sinyal) → EXHAUSTION_4 DOWN  (dari state lanjutan)
-    #     → BENAR/SALAH : selalu reset (max level 4)
+    # Berlaku simetris: 3🔴 → notif "potensi UP", dst.
     #
-    # Berlaku simetris untuk streak merah → sinyal UP
+    # CATATAN PENTING:
+    # - Streak dihitung TERMASUK candle sinyal (candle[-1])
+    # - Sinyal EXH-3 hanya muncul sekali per streak (saat streak tepat = 3)
+    # - Sinyal EXH-4 hanya muncul jika EXH-3 sebelumnya SALAH
+    #   (dicegah oleh exh_state — jika state kosong dan streak=4, tidak signal)
     # ══════════════════════════════════════════════════════════════════════════
     if result is None:
-        # Hitung streak berturut-turut dari candle SEBELUM candle sinyal
-        # Ambil 5 candle sebelum sinyal (cukup untuk deteksi 4 streak)
-        lookback = candles[-6:-1]  # candles[-1] = sinyal, exclude
+        # Hitung streak TERMASUK candle sinyal saat ini (candles[-1])
+        lookback_incl = candles[-5:]  # max 5 candle terakhir
 
-        # Streak merah dari candle terbaru ke belakang (berhenti saat bukan merah)
+        # Streak merah berturut (termasuk candle sinyal)
         bearish_streak = 0
-        for prev_c in reversed(lookback):
+        for prev_c in reversed(lookback_incl):
             if prev_c[4] < prev_c[1]:   # close < open = merah
                 bearish_streak += 1
             else:
                 break
 
-        # Streak hijau dari candle terbaru ke belakang
+        # Streak hijau berturut (termasuk candle sinyal)
         bullish_streak = 0
-        for prev_c in reversed(lookback):
+        for prev_c in reversed(lookback_incl):
             if prev_c[4] >= prev_c[1]:  # close >= open = hijau
                 bullish_streak += 1
             else:
                 break
 
-        candle_is_green = close >= o
-        candle_is_red   = close < o
-
-        # Effective streak: gabung state tersimpan + streak baru
-        # State tersimpan ada jika sinyal sebelumnya SALAH
-        if exh_state and exh_state.get("color") == "RED" and bearish_streak > 0:
-            effective_bearish = exh_state["count"] + bearish_streak
-        else:
-            effective_bearish = bearish_streak
-
-        if exh_state and exh_state.get("color") == "GREEN" and bullish_streak > 0:
-            effective_bullish = exh_state["count"] + bullish_streak
-        else:
-            effective_bullish = bullish_streak
+        # Cek apakah EXH-3 sebelumnya pernah salah (state tersimpan)
+        prev_color = exh_state.get("color", "") if exh_state else ""
+        prev_count = exh_state.get("count", 0) if exh_state else 0
 
         log.debug(
-            f"  Exhaustion: 🔴streak={bearish_streak}(eff={effective_bearish}) "
-            f"🟢streak={bullish_streak}(eff={effective_bullish}) state={exh_state}"
+            f"  Exhaustion: 🔴={bearish_streak} 🟢={bullish_streak} "
+            f"prev={prev_color}/{prev_count}"
         )
 
-        # ── Cek apakah streak = 3 atau 4 (level yang valid) ──────────────────
-        # effective_bearish = 3 atau 4 + candle sinyal hijau → UP
-        if effective_bearish in EXHAUSTION_LEVELS and candle_is_green:
-            lvl, ltype = find_nearest_snr(close, "UP", snr)
-            if not EXHAUSTION_SNR_REQ or lvl is not None:
-                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else ""
-                result = {
-                    "signal":        "UP",
-                    "pattern":       "EXHAUSTION",
-                    "wick_pct":      None,
-                    "body_pct":      None,
-                    "lvl":           lvl,
-                    "lvl_type":      ltype or "Support",
-                    "streak_color":  "RED",
-                    "streak_count":  effective_bearish,
-                    "extra": (
-                        f"{effective_bearish}🔴 berturut + 🟢 sinyal "
-                        f"→ potensi UP{snr_info}"
-                    ),
-                }
-
-        # effective_bullish = 3 atau 4 + candle sinyal merah → DOWN
-        elif effective_bullish in EXHAUSTION_LEVELS and candle_is_red:
+        # ── 3🟢 berturut → signal DOWN (potensi reversal) ─────────────────────
+        if bullish_streak == 3:
             lvl, ltype = find_nearest_snr(close, "DOWN", snr)
             if not EXHAUSTION_SNR_REQ or lvl is not None:
                 snr_info = f" + {ltype} ${lvl:.4f}" if lvl else ""
                 result = {
-                    "signal":        "DOWN",
-                    "pattern":       "EXHAUSTION",
-                    "wick_pct":      None,
-                    "body_pct":      None,
-                    "lvl":           lvl,
-                    "lvl_type":      ltype or "Resistance",
-                    "streak_color":  "GREEN",
-                    "streak_count":  effective_bullish,
-                    "extra": (
-                        f"{effective_bullish}🟢 berturut + 🔴 sinyal "
-                        f"→ potensi DOWN{snr_info}"
-                    ),
+                    "signal":       "DOWN",
+                    "pattern":      "EXHAUSTION",
+                    "wick_pct":     None,
+                    "body_pct":     None,
+                    "lvl":          lvl,
+                    "lvl_type":     ltype or "Resistance",
+                    "streak_color": "GREEN",
+                    "streak_count": 3,
+                    "extra":        f"3🟢 berturut → potensi DOWN{snr_info}",
+                }
+
+        # ── 4🟢 berturut → signal DOWN lagi (hanya jika EXH-3 sebelumnya salah) ──
+        elif bullish_streak == 4 and prev_color == "GREEN" and prev_count == 3:
+            lvl, ltype = find_nearest_snr(close, "DOWN", snr)
+            if not EXHAUSTION_SNR_REQ or lvl is not None:
+                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else ""
+                result = {
+                    "signal":       "DOWN",
+                    "pattern":      "EXHAUSTION",
+                    "wick_pct":     None,
+                    "body_pct":     None,
+                    "lvl":          lvl,
+                    "lvl_type":     ltype or "Resistance",
+                    "streak_color": "GREEN",
+                    "streak_count": 4,
+                    "extra":        f"4🟢 berturut → potensi DOWN{snr_info}",
+                }
+
+        # ── 3🔴 berturut → signal UP (potensi reversal) ───────────────────────
+        elif bearish_streak == 3:
+            lvl, ltype = find_nearest_snr(close, "UP", snr)
+            if not EXHAUSTION_SNR_REQ or lvl is not None:
+                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else ""
+                result = {
+                    "signal":       "UP",
+                    "pattern":      "EXHAUSTION",
+                    "wick_pct":     None,
+                    "body_pct":     None,
+                    "lvl":          lvl,
+                    "lvl_type":     ltype or "Support",
+                    "streak_color": "RED",
+                    "streak_count": 3,
+                    "extra":        f"3🔴 berturut → potensi UP{snr_info}",
+                }
+
+        # ── 4🔴 berturut → signal UP lagi (hanya jika EXH-3 sebelumnya salah) ──
+        elif bearish_streak == 4 and prev_color == "RED" and prev_count == 3:
+            lvl, ltype = find_nearest_snr(close, "UP", snr)
+            if not EXHAUSTION_SNR_REQ or lvl is not None:
+                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else ""
+                result = {
+                    "signal":       "UP",
+                    "pattern":      "EXHAUSTION",
+                    "wick_pct":     None,
+                    "body_pct":     None,
+                    "lvl":          lvl,
+                    "lvl_type":     ltype or "Support",
+                    "streak_color": "RED",
+                    "streak_count": 4,
+                    "extra":        f"4🔴 berturut → potensi UP{snr_info}",
                 }
 
     # POLA 3: WICK
@@ -961,21 +978,23 @@ def run_bot():
                     if pattern == "EXHAUSTION":
                         prev       = exhaustion_state[coin_name]
                         prev_count = prev.get("count", 0)
-                        # Sinyal SALAH dari level 3 → lanjut ke level 4
-                        # Sinyal SALAH dari level 4 → reset (max level 4)
-                        if prev_count == 3:
+                        # Sinyal SALAH:
+                        # Level 3 salah → candle ke-4 masih sama warna
+                        #   → state disimpan, tunggu candle berikutnya (level 4)
+                        # Level 4 salah → reset total (max level 4)
+                        streak_count = ps.get("streak_count", 3)
+                        if streak_count == 3:
                             exhaustion_state[coin_name] = {
-                                "color": prev["color"],
-                                "count": 3,  # akan jadi effective 4 di candle berikutnya
+                                "color": ps.get("streak_color", ""),
+                                "count": 3,
                             }
                             log.info(
-                                f"  ➕ Exhaustion streak {coin_name} lanjut ke level 4 "
-                                f"({prev['color']})"
+                                f"  ➕ Exhaustion {coin_name} salah di level 3, "
+                                f"siap lanjut ke level 4"
                             )
                         else:
-                            # Level 4 salah → reset total
                             exhaustion_state[coin_name] = {"color": "", "count": 0}
-                            log.info(f"  🔄 Exhaustion streak {coin_name} direset (level 4 salah)")
+                            log.info(f"  🔄 Exhaustion streak {coin_name} direset (level 4 salah/selesai)")
 
                 streak = check_streak(coin_name, pattern, result_history[pattern])
                 if streak:
@@ -998,14 +1017,16 @@ def run_bot():
                 dt_c = datetime.fromtimestamp(last_open_ts/1000, tz=timezone.utc).strftime("%H:%M")
                 log.info(f"🔍 {coin['name']} 15M [{dt_c} UTC]")
 
-                # Kirim exhaustion_state ke detect_pattern untuk tracking streak
+                # Kirim exhaustion_state ke detect_pattern
+                # State digunakan untuk tahu apakah level 3 sudah pernah salah
+                # sehingga bot bisa trigger level 4 saat streak 4 terjadi
                 exh_st = exhaustion_state.get(coin["name"], {"color": "", "count": 0})
                 sig = detect_pattern(key, candles, coin_name=coin["name"], exh_state=exh_st)
 
                 if sig is None:
-                    # Jika tidak ada pola dan exhaustion state ada tapi streak putus → reset
-                    ts_last = candles[-1]
-                    c_close, c_open = ts_last[4], ts_last[1]
+                    # Reset state jika streak warna berbeda dari state tersimpan
+                    last_c = candles[-1]
+                    c_close, c_open = last_c[4], last_c[1]
                     exh_color = exh_st.get("color", "")
                     streak_putus = (
                         (exh_color == "GREEN" and c_close < c_open) or
@@ -1013,7 +1034,7 @@ def run_bot():
                     )
                     if streak_putus:
                         exhaustion_state[coin["name"]] = {"color": "", "count": 0}
-                        log.debug(f"  🔄 Exhaustion streak {coin['name']} direset (streak putus)")
+                        log.debug(f"  🔄 Exhaustion {coin['name']} direset (streak putus)")
                     log.debug(f"  ↳ {coin['name']} — tidak ada pola valid.")
                     continue
 
