@@ -272,24 +272,18 @@ def detect_pattern(symbol, candles, coin_name="", exh_state=None):
 
     # ══════════════════════════════════════════════════════════════════════════
     # URUTAN PRIORITAS DETEKSI POLA:
-    # 1. MOMENTUM  — body kuat + volume tinggi (paling cepat dikonfirmasi)
-    # 2. EXHAUSTION — 3-5 candle warna sama → kemungkinan berbalik
-    # 3. WICK       — ekor panjang + dekat S/R
-    # 4. FALSE BREAK — spike tembus S/R lalu balik (paling jarang, paling kuat)
+    # 1. EXHAUSTION — dicek PERTAMA agar tidak terblokir pola lain
+    # 2. WICK       — ekor panjang + dekat S/R
+    # 3. FALSE BREAK — spike tembus S/R lalu balik
+    # 4. MOMENTUM  — body kuat + volume tinggi (terakhir, filter paling ketat)
     # ══════════════════════════════════════════════════════════════════════════
 
-    # POLA 1: MOMENTUM
-    if vol_ok:
-        if close > o and body_ratio >= BODY_RATIO_MIN and close_pos >= CLOSE_UPPER_MIN:
-            lvl, ltype = find_nearest_snr(close, "UP", snr)
-            result = {"signal":"UP","pattern":"MOMENTUM","wick_pct":None,"body_pct":body_ratio*100,
-                      "lvl":lvl,"lvl_type":ltype or "Support",
-                      "extra":f"Bullish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
-        elif close < o and body_ratio >= BODY_RATIO_MIN and close_pos <= CLOSE_LOWER_MAX:
-            lvl, ltype = find_nearest_snr(close, "DOWN", snr)
-            result = {"signal":"DOWN","pattern":"MOMENTUM","wick_pct":None,"body_pct":body_ratio*100,
-                      "lvl":lvl,"lvl_type":ltype or "Resistance",
-                      "extra":f"Bearish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
+    # POLA 1: MOMENTUM (disiapkan dulu tapi dicek terakhir)
+    # Variabel ini akan dipakai di POLA 4 di bawah
+    momentum_up = (vol_ok and close > o and
+                   body_ratio >= BODY_RATIO_MIN and close_pos >= CLOSE_UPPER_MIN)
+    momentum_dn = (vol_ok and close < o and
+                   body_ratio >= BODY_RATIO_MIN and close_pos <= CLOSE_LOWER_MAX)
 
     # ══════════════════════════════════════════════════════════════════════════
     # POLA 2: EXHAUSTION — Logika Final v3
@@ -407,7 +401,7 @@ def detect_pattern(symbol, candles, coin_name="", exh_state=None):
                     "extra":        f"4🔴 berturut → potensi UP{snr_info}",
                 }
 
-    # POLA 3: WICK
+    # POLA 2: WICK
     if result is None and lo_ratio >= WICK_RATIO_MIN:
         lvl, ltype = find_nearest_snr(close, "UP", snr)
         if lvl is not None:
@@ -421,7 +415,7 @@ def detect_pattern(symbol, candles, coin_name="", exh_state=None):
                       "lvl":lvl,"lvl_type":ltype,
                       "extra":f"Upper Wick {up_ratio*100:.1f}% + {ltype} ${lvl:.4f}"}
 
-    # POLA 4: FALSE BREAK
+    # POLA 3: FALSE BREAK
     if result is None:
         for sup in snr["supports"]:
             depth = (sup - l) / close
@@ -439,32 +433,74 @@ def detect_pattern(symbol, candles, coin_name="", exh_state=None):
                           "extra":f"False Break ↑{depth*100:.2f}% atas ${res:.4f}"}
                 break
 
+    # POLA 4: MOMENTUM (dicek terakhir — filter paling ketat)
+    if result is None:
+        if momentum_up:
+            lvl, ltype = find_nearest_snr(close, "UP", snr)
+            result = {"signal":"UP","pattern":"MOMENTUM","wick_pct":None,
+                      "body_pct":body_ratio*100,"lvl":lvl,"lvl_type":ltype or "Support",
+                      "extra":f"Bullish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
+        elif momentum_dn:
+            lvl, ltype = find_nearest_snr(close, "DOWN", snr)
+            result = {"signal":"DOWN","pattern":"MOMENTUM","wick_pct":None,
+                      "body_pct":body_ratio*100,"lvl":lvl,"lvl_type":ltype or "Resistance",
+                      "extra":f"Bearish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
+
     if result is None:
         return None
 
-    # Filter RSI
-    rsi_ok = (result["signal"]=="UP" and rsi < RSI_UP_MAX) or (result["signal"]=="DOWN" and rsi > RSI_DOWN_MIN)
+    # ── EXHAUSTION: bypass filter RSI dan HTF ─────────────────────────────────
+    # Exhaustion punya logika sendiri (streak candle) — tidak perlu RSI/HTF
+    # karena momentum bisa habis di kondisi apapun (overbought, oversold, neutral)
+    if result["pattern"] == "EXHAUSTION":
+        htf_bias = get_htf_bias(symbol)
+        result.update({
+            "candle":    c,
+            "rsi":       rsi,
+            "vol_ratio": vol_ratio,
+            "vol_ok":    vol_ok,
+            "htf_bias":  htf_bias,
+        })
+        log.debug(f"  ↳ EXHAUSTION bypass RSI/HTF | RSI:{rsi:.1f} HTF:{htf_bias}")
+        return result
+
+    # ── Filter RSI (untuk WICK, FALSE_BREAK, MOMENTUM) ───────────────────────
+    rsi_ok = (
+        (result["signal"] == "UP"   and rsi < RSI_UP_MAX) or
+        (result["signal"] == "DOWN" and rsi > RSI_DOWN_MIN)
+    )
     if not rsi_ok:
         log.debug(f"  ↳ DITOLAK RSI {rsi:.1f}")
         return None
 
-    # Filter Volume
+    # ── Filter Volume (hanya MOMENTUM) ───────────────────────────────────────
     if result["pattern"] == "MOMENTUM" and not vol_ok:
         log.debug(f"  ↳ DITOLAK Volume ×{vol_ratio:.2f}")
         return None
 
-    # Filter HTF Bias
+    # ── Filter HTF Bias (untuk WICK, FALSE_BREAK, MOMENTUM) ──────────────────
     htf_bias = get_htf_bias(symbol)
     if HTF_STRICT:
-        htf_ok = (result["signal"]=="UP" and htf_bias=="BULLISH") or (result["signal"]=="DOWN" and htf_bias=="BEARISH")
+        htf_ok = (
+            (result["signal"] == "UP"   and htf_bias == "BULLISH") or
+            (result["signal"] == "DOWN" and htf_bias == "BEARISH")
+        )
     else:
-        htf_ok = (result["signal"]=="UP" and htf_bias in ("BULLISH","NEUTRAL")) or \
-                 (result["signal"]=="DOWN" and htf_bias in ("BEARISH","NEUTRAL"))
+        htf_ok = (
+            (result["signal"] == "UP"   and htf_bias in ("BULLISH", "NEUTRAL")) or
+            (result["signal"] == "DOWN" and htf_bias in ("BEARISH", "NEUTRAL"))
+        )
     if not htf_ok:
         log.debug(f"  ↳ DITOLAK HTF 1H={htf_bias}")
         return None
 
-    result.update({"candle":c,"rsi":rsi,"vol_ratio":vol_ratio,"vol_ok":vol_ok,"htf_bias":htf_bias})
+    result.update({
+        "candle":    c,
+        "rsi":       rsi,
+        "vol_ratio": vol_ratio,
+        "vol_ok":    vol_ok,
+        "htf_bias":  htf_bias,
+    })
     return result
 
 # ============================================================
