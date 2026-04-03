@@ -46,8 +46,9 @@ HTF_INTERVAL        = "1h"
 
 # ── Candle Exhaustion (strategi baru) ────────────────────────────────────────
 # Setelah N candle berturut-turut satu warna → kemungkinan besar berbalik
-EXHAUSTION_MIN      = int(os.getenv("EXHAUSTION_MIN", "3"))    # min 3 candle searah
-EXHAUSTION_MAX      = int(os.getenv("EXHAUSTION_MAX", "5"))    # max 5 candle searah
+# Exhaustion: sinyal diberikan setelah tepat 3 atau 4 candle warna sama
+# Tidak ada EXHAUSTION_MIN/MAX lagi — hanya 3 dan 4 yang valid
+EXHAUSTION_LEVELS   = [3, 4]  # level streak yang valid untuk sinyal
 # True = wajib dekat S/R, False = boleh tanpa S/R (lebih banyak sinyal)
 EXHAUSTION_SNR_REQ  = os.getenv("EXHAUSTION_SNR_REQ", "False").lower() == "true"
 
@@ -290,113 +291,104 @@ def detect_pattern(symbol, candles, coin_name="", exh_state=None):
                       "lvl":lvl,"lvl_type":ltype or "Resistance",
                       "extra":f"Bearish Body {body_ratio*100:.1f}% Vol×{vol_ratio:.2f}"}
 
-    # POLA 2: EXHAUSTION (3-5 candle warna sama → prediksi balik arah)
+    # ══════════════════════════════════════════════════════════════════════════
+    # POLA 2: EXHAUSTION — Logika Final
     #
-    # LOGIKA YANG BENAR:
-    # - Hitung streak BERTURUT-TURUT dari candle[-2] ke belakang
-    #   (candle[-1] = candle sinyal, TIDAK ikut dihitung)
-    # - Streak HARUS berturut-turut tanpa putus
-    #   Contoh: 🟢🟢🔴🟢🟢 → streak = 2 (bukan 4!)
-    #   Streak berhenti begitu ada warna berbeda
-    # - Candle sinyal HARUS berlawanan warna dari streak sebagai
-    #   konfirmasi pertama pembalikan
-    #   Contoh: 🟢🟢🟢 + 🔴 (sinyal) = valid DOWN
-    #           🟢🟢🟢 + 🟢 (sinyal) = TIDAK valid (streak belum berakhir)
+    # SINYAL diberikan saat ada tepat 3 atau 4 candle warna sama BERTURUT-TURUT
+    # (dihitung dari candle SEBELUM candle sinyal, tidak termasuk candle sinyal)
+    # dan candle sinyal sendiri BERLAWANAN warna (konfirmasi awal reversal).
+    #
+    # Flow:
+    #   🟢🟢🟢 + 🔴(sinyal) → EXHAUSTION_3 DOWN
+    #     → BENAR  : reset streak
+    #     → SALAH  : candle ke-4 masih 🟢 → state = {GREEN, 3}
+    #
+    #   🟢🟢🟢🟢 + 🔴(sinyal) → EXHAUSTION_4 DOWN  (dari state lanjutan)
+    #     → BENAR/SALAH : selalu reset (max level 4)
+    #
+    # Berlaku simetris untuk streak merah → sinyal UP
+    # ══════════════════════════════════════════════════════════════════════════
     if result is None:
-        # Ambil candle sebelum candle sinyal — maksimal EXHAUSTION_MAX candle
-        # candles[-2] = candle paling baru sebelum sinyal
-        lookback = candles[-(EXHAUSTION_MAX + 2):-1]
+        # Hitung streak berturut-turut dari candle SEBELUM candle sinyal
+        # Ambil 5 candle sebelum sinyal (cukup untuk deteksi 4 streak)
+        lookback = candles[-6:-1]  # candles[-1] = sinyal, exclude
 
-        # Hitung streak bearish BERTURUT-TURUT dari candle terbaru ke belakang
-        # Berhenti begitu ada candle yang bukan merah
+        # Streak merah dari candle terbaru ke belakang (berhenti saat bukan merah)
         bearish_streak = 0
         for prev_c in reversed(lookback):
             if prev_c[4] < prev_c[1]:   # close < open = merah
                 bearish_streak += 1
             else:
-                break   # streak putus, stop hitung
+                break
 
-        # Hitung streak bullish BERTURUT-TURUT dari candle terbaru ke belakang
+        # Streak hijau dari candle terbaru ke belakang
         bullish_streak = 0
         for prev_c in reversed(lookback):
             if prev_c[4] >= prev_c[1]:  # close >= open = hijau
                 bullish_streak += 1
             else:
-                break   # streak putus, stop hitung
+                break
 
-        candle_is_green = close >= o   # candle sinyal hijau
-        candle_is_red   = close < o    # candle sinyal merah
+        candle_is_green = close >= o
+        candle_is_red   = close < o
 
-        # ── Gabungkan streak dari state tersimpan + streak baru ───────────────
-        # Jika sinyal EXHAUSTION sebelumnya SALAH, streak dilanjutkan (+1).
-        # exh_state menyimpan {color, count} dari sinyal terakhir yang salah.
-        # Contoh:
-        #   Sinyal 1: 3🟢 + 🔴 = DOWN (salah) → state = {GREEN, 3}
-        #   Candle baru: masih 🟢 → streak jadi 4
-        #   Sinyal 2: 4🟢 + 🔴 = DOWN (dengan streak lanjutan)
-
-        # Effective streak = dari state tersimpan jika warna sama, else dari candle baru
+        # Effective streak: gabung state tersimpan + streak baru
+        # State tersimpan ada jika sinyal sebelumnya SALAH
         if exh_state and exh_state.get("color") == "RED" and bearish_streak > 0:
-            # Streak merah dilanjutkan dari sinyal sebelumnya yang salah
             effective_bearish = exh_state["count"] + bearish_streak
         else:
             effective_bearish = bearish_streak
 
         if exh_state and exh_state.get("color") == "GREEN" and bullish_streak > 0:
-            # Streak hijau dilanjutkan dari sinyal sebelumnya yang salah
             effective_bullish = exh_state["count"] + bullish_streak
         else:
             effective_bullish = bullish_streak
 
         log.debug(
-            f"  Exhaustion: bearish={bearish_streak}(eff={effective_bearish}) "
-            f"bullish={bullish_streak}(eff={effective_bullish}) "
-            f"state={exh_state}"
+            f"  Exhaustion: 🔴streak={bearish_streak}(eff={effective_bearish}) "
+            f"🟢streak={bullish_streak}(eff={effective_bullish}) state={exh_state}"
         )
 
-        # N candle merah sebelumnya + candle sinyal HIJAU = reversal UP
-        if EXHAUSTION_MIN <= effective_bearish <= EXHAUSTION_MAX and candle_is_green:
+        # ── Cek apakah streak = 3 atau 4 (level yang valid) ──────────────────
+        # effective_bearish = 3 atau 4 + candle sinyal hijau → UP
+        if effective_bearish in EXHAUSTION_LEVELS and candle_is_green:
             lvl, ltype = find_nearest_snr(close, "UP", snr)
             if not EXHAUSTION_SNR_REQ or lvl is not None:
-                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else " (no S/R)"
+                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else ""
                 result = {
-                    "signal":   "UP",
-                    "pattern":  "EXHAUSTION",
-                    "wick_pct": None,
-                    "body_pct": None,
-                    "lvl":      lvl,
-                    "lvl_type": ltype or "Support",
-                    "streak_color": "RED",
-                    "streak_count": effective_bearish,
+                    "signal":        "UP",
+                    "pattern":       "EXHAUSTION",
+                    "wick_pct":      None,
+                    "body_pct":      None,
+                    "lvl":           lvl,
+                    "lvl_type":      ltype or "Support",
+                    "streak_color":  "RED",
+                    "streak_count":  effective_bearish,
                     "extra": (
-                        f"{effective_bearish}🔴 berturut + candle 🟢 "
+                        f"{effective_bearish}🔴 berturut + 🟢 sinyal "
                         f"→ potensi UP{snr_info}"
                     ),
                 }
 
-        # N candle hijau sebelumnya + candle sinyal MERAH = reversal DOWN
-        elif EXHAUSTION_MIN <= effective_bullish <= EXHAUSTION_MAX and candle_is_red:
+        # effective_bullish = 3 atau 4 + candle sinyal merah → DOWN
+        elif effective_bullish in EXHAUSTION_LEVELS and candle_is_red:
             lvl, ltype = find_nearest_snr(close, "DOWN", snr)
             if not EXHAUSTION_SNR_REQ or lvl is not None:
-                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else " (no S/R)"
+                snr_info = f" + {ltype} ${lvl:.4f}" if lvl else ""
                 result = {
-                    "signal":   "DOWN",
-                    "pattern":  "EXHAUSTION",
-                    "wick_pct": None,
-                    "body_pct": None,
-                    "lvl":      lvl,
-                    "lvl_type": ltype or "Resistance",
-                    "streak_color": "GREEN",
-                    "streak_count": effective_bullish,
+                    "signal":        "DOWN",
+                    "pattern":       "EXHAUSTION",
+                    "wick_pct":      None,
+                    "body_pct":      None,
+                    "lvl":           lvl,
+                    "lvl_type":      ltype or "Resistance",
+                    "streak_color":  "GREEN",
+                    "streak_count":  effective_bullish,
                     "extra": (
-                        f"{effective_bullish}🟢 berturut + candle 🔴 "
+                        f"{effective_bullish}🟢 berturut + 🔴 sinyal "
                         f"→ potensi DOWN{snr_info}"
                     ),
                 }
-        else:
-            # Streak putus atau di luar range → reset state
-            if exh_state is not None and coin_name:
-                pass  # reset akan dilakukan di run_bot saat streak tidak match
 
     # POLA 3: WICK
     if result is None and lo_ratio >= WICK_RATIO_MIN:
@@ -758,21 +750,21 @@ def build_daily_report(stats_pat, stats_coin):
     # ── Exhaustion dipisah per jumlah streak ──────────────────────────────────
     msg += "\n🔁 <b>Exhaustion (per streak):</b>\n"
     exh_tw, exh_tl, exh_tc = 0, 0, 0
-    for n in [3, 4, 5]:
-        key = f"EXHAUSTION_{n}"
+    for n, icon in [(3, "3🔴→🟢 / 3🟢→🔴"), (4, "4🔴→🟢 / 4🟢→🔴")]:
+        key   = f"EXHAUSTION_{n}"
         s     = stats_pat.get(key, {"win":0,"loss":0,"cancelled":0})
         total = s["win"] + s["loss"]
         wr    = (s["win"]/total*100) if total > 0 else 0
-        tw      += s["win"]
-        tl      += s["loss"]
-        exh_tw  += s["win"]
-        exh_tl  += s["loss"]
-        exh_tc  += s["cancelled"]
-        candle_icon = "🔴/🟢" if n == 3 else ("🔴🔴/🟢🟢" if n == 4 else "🔴🔴🔴/🟢🟢🟢")
-        msg += f"  [{n} candle {candle_icon}] ✅{s['win']} ❌{s['loss']} ❎{s['cancelled']} | WR:{wr:.1f}%\n"
+        tw    += s["win"]
+        tl    += s["loss"]
+        exh_tw += s["win"]
+        exh_tl += s["loss"]
+        exh_tc += s["cancelled"]
+        msg   += f"  [EXH-{n}] {icon}\n"
+        msg   += f"         ✅{s['win']} ❌{s['loss']} ❎{s['cancelled']} | WR:{wr:.1f}%\n"
     exh_total = exh_tw + exh_tl
     exh_wr    = (exh_tw/exh_total*100) if exh_total > 0 else 0
-    msg += f"  [EXHAUSTION total] ✅{exh_tw} ❌{exh_tl} ❎{exh_tc} | WR:{exh_wr:.1f}%\n"
+    msg += f"  [EXH-total] ✅{exh_tw} ❌{exh_tl} ❎{exh_tc} | WR:{exh_wr:.1f}%\n"
 
     # ── Per Coin ──────────────────────────────────────────────────────────────
     msg += "\n🪙 <b>Per Coin:</b>\n"
@@ -809,7 +801,7 @@ def build_weekly_report(stats_pat, stats_coin, days):
 
     msg += "\n🔁 <b>Exhaustion (per streak):</b>\n"
     exh_tw, exh_tl = 0, 0
-    for n in [3, 4, 5]:
+    for n, icon in [(3, "3🔴→🟢 / 3🟢→🔴"), (4, "4🔴→🟢 / 4🟢→🔴")]:
         key   = f"EXHAUSTION_{n}"
         s     = stats_pat.get(key, {"win":0,"loss":0,"cancelled":0})
         total = s["win"] + s["loss"]
@@ -818,10 +810,10 @@ def build_weekly_report(stats_pat, stats_coin, days):
         tl    += s["loss"]
         exh_tw += s["win"]
         exh_tl += s["loss"]
-        msg   += f"  [{n} candle] ✅{s['win']} ❌{s['loss']} | WR:{wr:.1f}%\n"
+        msg   += f"  [EXH-{n}] {icon} ✅{s['win']} ❌{s['loss']} | WR:{wr:.1f}%\n"
     exh_total = exh_tw + exh_tl
     exh_wr    = (exh_tw/exh_total*100) if exh_total > 0 else 0
-    msg += f"  [EXHAUSTION total] ✅{exh_tw} ❌{exh_tl} | WR:{exh_wr:.1f}%\n"
+    msg += f"  [EXH-total] ✅{exh_tw} ❌{exh_tl} | WR:{exh_wr:.1f}%\n"
 
     msg += "\n🪙 <b>Per Coin:</b>\n"
     for cn, cs in sorted(stats_coin.items()):
@@ -869,9 +861,9 @@ def run_bot():
     log.info(f"   FIX v8     : Ref price = close candle 15M (acuan Polymarket)")
 
     pending_signals      = []
-    daily_stats_pat      = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4","EXHAUSTION_5"]}
+    daily_stats_pat      = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4"]}
     daily_stats_coin     = {c["name"]:{"win":0,"loss":0} for c in COINS}
-    weekly_stats_pat     = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4","EXHAUSTION_5"]}
+    weekly_stats_pat     = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4"]}
     weekly_stats_coin    = {c["name"]:{"win":0,"loss":0} for c in COINS}
     result_history       = defaultdict(list)
     last_processed       = {}
@@ -903,21 +895,21 @@ def run_bot():
                     log.info("📊 Daily report dikirim.")
 
                     weekly_day_count += 1
-                    for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4","EXHAUSTION_5"]:
+                    for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4"]:
                         for k in ["win","loss","cancelled"]:
                             weekly_stats_pat[p][k] += daily_stats_pat[p].get(k, 0)
                     for cn in daily_stats_coin:
                         for k in ["win","loss"]:
                             weekly_stats_coin[cn][k] += daily_stats_coin[cn].get(k, 0)
 
-                    daily_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4","EXHAUSTION_5"]}
+                    daily_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4"]}
                     daily_stats_coin = {c["name"]:{"win":0,"loss":0} for c in COINS}
                     daily_report_sent = today_str
 
                     if weekly_day_count >= 7:
                         send_telegram(build_weekly_report(weekly_stats_pat, weekly_stats_coin, weekly_day_count))
                         log.info("📊 Weekly report dikirim.")
-                        weekly_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4","EXHAUSTION_5"]}
+                        weekly_stats_pat  = {p:{"win":0,"loss":0,"cancelled":0} for p in ["WICK","FALSE_BREAK","MOMENTUM","EXHAUSTION_3","EXHAUSTION_4"]}
                         weekly_stats_coin = {c["name"]:{"win":0,"loss":0} for c in COINS}
                         weekly_day_count  = 0
 
@@ -957,7 +949,7 @@ def run_bot():
                     daily_stats_coin[coin_name]["win"] += 1
                     result_history[stats_key].append(True)
                     log.info(f"  ✅ {coin_name} [{stats_key}] BENAR (ref:{ps['ref_price']:.4f} → result:{result_price:.4f})")
-                    # Sinyal BENAR → reset exhaustion streak
+                    # Sinyal BENAR → selalu reset exhaustion streak
                     if pattern == "EXHAUSTION":
                         exhaustion_state[coin_name] = {"color": "", "count": 0}
                         log.info(f"  🔄 Exhaustion streak {coin_name} direset (sinyal BENAR)")
@@ -966,22 +958,24 @@ def run_bot():
                     daily_stats_coin[coin_name]["loss"] += 1
                     result_history[stats_key].append(False)
                     log.info(f"  ❌ {coin_name} [{stats_key}] SALAH (ref:{ps['ref_price']:.4f} → result:{result_price:.4f})")
-                    # Sinyal SALAH → lanjutkan streak (+1 candle)
                     if pattern == "EXHAUSTION":
-                        prev      = exhaustion_state[coin_name]
-                        new_count = prev["count"] + 1
-                        if new_count <= EXHAUSTION_MAX:
+                        prev       = exhaustion_state[coin_name]
+                        prev_count = prev.get("count", 0)
+                        # Sinyal SALAH dari level 3 → lanjut ke level 4
+                        # Sinyal SALAH dari level 4 → reset (max level 4)
+                        if prev_count == 3:
                             exhaustion_state[coin_name] = {
                                 "color": prev["color"],
-                                "count": new_count,
+                                "count": 3,  # akan jadi effective 4 di candle berikutnya
                             }
                             log.info(
-                                f"  ➕ Exhaustion streak {coin_name} lanjut: "
-                                f"{new_count} candle {prev['color']}"
+                                f"  ➕ Exhaustion streak {coin_name} lanjut ke level 4 "
+                                f"({prev['color']})"
                             )
                         else:
+                            # Level 4 salah → reset total
                             exhaustion_state[coin_name] = {"color": "", "count": 0}
-                            log.info(f"  🔄 Exhaustion streak {coin_name} direset (melebihi MAX)")
+                            log.info(f"  🔄 Exhaustion streak {coin_name} direset (level 4 salah)")
 
                 streak = check_streak(coin_name, pattern, result_history[pattern])
                 if streak:
