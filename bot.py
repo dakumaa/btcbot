@@ -15,7 +15,6 @@ import time
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 
-import ccxt
 import pandas as pd
 import pandas_ta as ta
 import requests
@@ -28,8 +27,10 @@ load_dotenv()
 # ============================================================
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "your_token_here")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "your_chat_id_here")
-BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY",    "")   # read-only, opsional
-BINANCE_API_SECRET  = os.getenv("BINANCE_API_SECRET", "")
+# Binance Vision = mirror publik Binance, tidak ada geo-block, tanpa API key
+# Sama persis dengan yang dipakai bot Polymarket sebelumnya
+BINANCE_KLINES_URL  = "https://data-api.binance.vision/api/v3/klines"
+BINANCE_TICKER_URL  = "https://data-api.binance.vision/api/v3/ticker/price"
 
 # ── Aset ──────────────────────────────────────────────────────────────────────
 ASSETS = [
@@ -265,39 +266,46 @@ def get_alltime_streak() -> dict:
 # ============================================================
 # 📡  BINANCE DATA FETCHER via CCXT
 # ============================================================
-_exchange = None
+# ── Mapping symbol ccxt → Binance REST format ─────────────────────────────────
+# ccxt pakai "BTC/USDT", Binance REST pakai "BTCUSDT"
+def to_binance_symbol(symbol: str) -> str:
+    return symbol.replace("/", "")
 
-def get_exchange() -> ccxt.binance:
-    global _exchange
-    if _exchange is None:
-        _exchange = ccxt.binance({
-            "apiKey":    BINANCE_API_KEY,
-            "secret":    BINANCE_API_SECRET,
-            "enableRateLimit": True,
-            "options":   {"defaultType": "spot"},
-        })
-    return _exchange
+# ── Mapping timeframe label → Binance interval string ─────────────────────────
+TF_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h"}
 
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame | None:
     """
-    Fetch OHLCV dari Binance via CCXT.
-    Returns DataFrame dengan kolom: timestamp, open, high, low, close, volume
-    Candle terakhir (live) dibuang.
+    Fetch OHLCV dari Binance Vision REST API.
+    Tidak ada geo-block, tidak butuh API key.
+    Candle terakhir (live) dibuang otomatis.
     """
+    bn_symbol = to_binance_symbol(symbol)
+    interval  = TF_MAP.get(timeframe, timeframe)
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            exc  = get_exchange()
-            data = exc.fetch_ohlcv(symbol, timeframe, limit=limit + 1)
-            if not data or len(data) < 3:
+            resp = requests.get(
+                BINANCE_KLINES_URL,
+                params={"symbol": bn_symbol, "interval": interval, "limit": limit + 1},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+
+            if not isinstance(raw, list) or len(raw) < 3:
                 return None
 
+            data = [
+                [int(r[0]), float(r[1]), float(r[2]),
+                 float(r[3]), float(r[4]), float(r[5])]
+                for r in raw
+            ]
             df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df = df.astype({"open": float, "high": float, "low": float,
-                            "close": float, "volume": float})
             return df.iloc[:-1].reset_index(drop=True)  # buang candle live
 
-        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+        except requests.exceptions.RequestException as e:
             log.warning(f"  ⚠️ Fetch {symbol} {timeframe} gagal (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(5)
@@ -306,13 +314,22 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame |
     return None
 
 def get_current_price(symbol: str) -> float | None:
-    try:
-        exc    = get_exchange()
-        ticker = exc.fetch_ticker(symbol)
-        return float(ticker["last"])
-    except Exception as e:
-        log.warning(f"  ⚠️ Harga {symbol} gagal: {e}")
-        return None
+    """Ambil harga terkini dari Binance Vision REST API."""
+    bn_symbol = to_binance_symbol(symbol)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(
+                BINANCE_TICKER_URL,
+                params={"symbol": bn_symbol},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return float(resp.json()["price"])
+        except Exception as e:
+            log.warning(f"  ⚠️ Harga {symbol} gagal (attempt {attempt}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(3)
+    return None
 
 # ============================================================
 # 📐  INDIKATOR TEKNIKAL
