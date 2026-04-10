@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================
-# TRADING SIGNAL BOT — Supply & Demand + Fractal Scalping
-# Aset    : BTC/USDT + XAUUSDT (Gold proxy)
-# TF      : 30M (zona) → 5M (konfirmasi) → 1M (entry trigger)
-# Strategi 1: Supply & Demand Classic (Ruang Trader style)
-# Strategi 2: Fractal Scalping Set & Forget (Forex Sarjana style)
-# Tracking: SQLite database + Daily Report 07:00 WIB
+# FOREX SIGNAL BOT — 3 Strategi Scalping Akun Cent $300
+# Pair     : EURUSD, GBPUSD, USDJPY, XAUUSD, BTCUSD
+# Strategi : S1 Imbalance+Fractal+EMA | S2 S&D RBR/DBR | S3 Pullback+OB+PA
+# Data     : Twelve Data API (Forex/Gold) + Binance Vision (BTC)
+# Risk     : $20/trade (6.5%), RR 1:2.5, spread 3 pips fixed
+# Signal   : Setup entry (limit order), bukan market order langsung
 # ============================================================
 
 import logging
@@ -13,7 +13,6 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
-from threading import Thread
 
 import pandas as pd
 import pandas_ta as ta
@@ -23,1123 +22,632 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# ⚙️  CONFIGURATION
+# CONFIGURATION
 # ============================================================
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "your_token_here")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "your_chat_id_here")
-# Binance Vision = mirror publik Binance, tidak ada geo-block, tanpa API key
-# Sama persis dengan yang dipakai bot Polymarket sebelumnya
-BINANCE_KLINES_URL  = "https://data-api.binance.vision/api/v3/klines"
-BINANCE_TICKER_URL  = "https://data-api.binance.vision/api/v3/ticker/price"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your_token_here")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "your_chat_id_here")
 
-# ── Aset ──────────────────────────────────────────────────────────────────────
+# Twelve Data API — gratis 800 req/day, daftar di twelvedata.com
+TWELVE_DATA_KEY    = os.getenv("TWELVE_DATA_KEY", "your_key_here")
+TWELVE_DATA_URL    = "https://api.twelvedata.com/time_series"
+TWELVE_PRICE_URL   = "https://api.twelvedata.com/price"
+
+# Binance Vision — BTC only, no geo-block, no API key
+BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
+BINANCE_TICKER_URL = "https://data-api.binance.vision/api/v3/ticker/price"
+
+# Account
+ACCOUNT_BALANCE    = float(os.getenv("ACCOUNT_BALANCE", "300"))
+RISK_PER_TRADE_USD = float(os.getenv("RISK_USD", "20"))
+RR_RATIO           = 2.5
+SPREAD_PIPS        = 3
+
+# Timeframes
+TF_HIGH = "30min"; TF_MID = "5min"; TF_LOW = "1min"   # Twelve Data
+TF_H_BN = "30m";   TF_M_BN = "5m";  TF_L_BN = "1m"   # Binance
+
+# Indicators
+ATR_PERIOD = 14; EMA_FAST = 21; EMA_SLOW = 50
+MA_FAST = 9;     MA_SLOW  = 21; STRONG_LEG_MULT = 1.5
+VOLUME_LOOKBACK = 20
+
+# Bot config
+SCAN_INTERVAL_SEC = 300; DAILY_REPORT_HOUR = 0
+SIGNAL_COOLDOWN_H = 2; DB_PATH = "signals.db"; LOG_FILE = "bot.log"
+MAX_RETRIES = 3
+
+# Pip sizes
+PIP_SIZE = {"EURUSD":0.0001,"GBPUSD":0.0001,"USDJPY":0.01,
+            "XAUUSD":0.01,"BTCUSD":1.00}
+
+# Lot value per pip per 0.01 lot (cent account)
+LOT_VALUE_PER_PIP = {"EURUSD":0.001,"GBPUSD":0.001,"USDJPY":0.001,
+                     "XAUUSD":0.01,"BTCUSD":0.1}
+
 ASSETS = [
-    {"symbol": "BTC/USDT",  "name": "BTC",  "risk_usd": 100.0},
-    {"symbol": "XAUT/USDT", "name": "XAU",  "risk_usd": 100.0},
+    {"name":"EURUSD","source":"twelve","sym_td":"EUR/USD","sym_bn":None},
+    {"name":"GBPUSD","source":"twelve","sym_td":"GBP/USD","sym_bn":None},
+    {"name":"USDJPY","source":"twelve","sym_td":"USD/JPY","sym_bn":None},
+    {"name":"XAUUSD","source":"twelve","sym_td":"XAU/USD","sym_bn":None},
+    {"name":"BTCUSD","source":"binance","sym_td":None,"sym_bn":"BTCUSDT"},
 ]
 
-# ── Timeframes ────────────────────────────────────────────────────────────────
-TF_HIGH  = "30m"   # deteksi zona Supply & Demand
-TF_MID   = "5m"    # konfirmasi zona + rejection
-TF_LOW   = "1m"    # entry trigger
-
-# ── Strategi parameter ────────────────────────────────────────────────────────
-ATR_PERIOD          = 14
-STRONG_LEG_MULT     = 1.5   # candle leg out harus ≥ 1.5× ATR
-ZONE_FRESH_BUFFER   = 0.001 # 0.1% toleransi zona fresh
-RR_RATIO            = 3.0   # Risk:Reward 1:3
-SCAN_INTERVAL_SEC   = 300   # scan setiap 5 menit
-
-# ── Report ────────────────────────────────────────────────────────────────────
-DAILY_REPORT_HOUR   = 0     # 00:00 UTC = 07:00 WIB
-DB_PATH             = "signals.db"
-LOG_FILE            = "bot.log"
-MAX_RETRIES         = 3
-
 # ============================================================
-# 📋  LOGGING
+# LOGGING
 # ============================================================
-def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("TradeBot")
+def setup_logger():
+    logger = logging.getLogger("ForexBot")
     logger.setLevel(logging.DEBUG)
-    fmt = logging.Formatter(
-        "[%(asctime)s UTC] %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
+    fmt = logging.Formatter("[%(asctime)s UTC] %(levelname)s | %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    ch = logging.StreamHandler(); ch.setLevel(logging.INFO); ch.setFormatter(fmt)
     logger.addHandler(ch)
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
+    fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); logger.addHandler(fh)
     return logger
 
 log = setup_logger()
 
 # ============================================================
-# 🗄️  DATABASE
+# DATABASE
 # ============================================================
 def init_db():
-    """Buat tabel SQLite jika belum ada."""
-    conn = sqlite3.connect(DB_PATH)
-    cur  = conn.cursor()
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp   TEXT    NOT NULL,
-            asset       TEXT    NOT NULL,
-            strategy    TEXT    NOT NULL,
-            signal_type TEXT    NOT NULL,
-            entry       REAL    NOT NULL,
-            sl          REAL    NOT NULL,
-            tp          REAL    NOT NULL,
-            rr          REAL    NOT NULL,
-            tf_confirm  TEXT    NOT NULL,
-            status      TEXT    DEFAULT 'OPEN',
-            result      TEXT,
-            pnl_pct     REAL,
-            pnl_usd     REAL,
-            close_time  TEXT,
-            notes       TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL, pair TEXT NOT NULL,
+            strategy TEXT NOT NULL, signal_type TEXT NOT NULL,
+            entry REAL, sl REAL, tp REAL,
+            zone_high REAL, zone_low REAL,
+            lot_size REAL, pips_risk REAL, rr REAL,
+            spread_pips REAL, tf_confirm TEXT,
+            status TEXT DEFAULT 'OPEN', result TEXT,
+            pnl_pct REAL, pnl_usd REAL,
+            close_time TEXT, notes TEXT
         )
     """)
-    conn.commit()
-    conn.close()
-    log.info("✅ Database siap.")
+    conn.commit(); conn.close(); log.info("Database siap.")
 
-def save_signal(asset, strategy, signal_type, entry, sl, tp, tf_confirm, notes="") -> int:
-    """Simpan sinyal baru ke database, return ID."""
-    conn = sqlite3.connect(DB_PATH)
-    cur  = conn.cursor()
-    cur.execute("""
-        INSERT INTO signals
-        (timestamp, asset, strategy, signal_type, entry, sl, tp, rr, tf_confirm, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        asset, strategy, signal_type, entry, sl, tp, RR_RATIO, tf_confirm, notes
-    ))
-    sig_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return sig_id
+def save_signal(pair, strategy, sig_type, entry, sl, tp, tf_confirm,
+                lot=0, pips_r=0, zh=None, zl=None, notes="") -> int:
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("""INSERT INTO signals
+        (timestamp,pair,strategy,signal_type,entry,sl,tp,zone_high,zone_low,
+         lot_size,pips_risk,rr,spread_pips,tf_confirm,notes)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+         pair,strategy,sig_type,entry,sl,tp,zh,zl,lot,pips_r,
+         RR_RATIO,SPREAD_PIPS,tf_confirm,notes))
+    sid = cur.lastrowid; conn.commit(); conn.close(); return sid
 
-def update_signal_result(sig_id: int, result: str, close_price: float, risk_usd: float):
-    """Update hasil trade (TP/SL) di database."""
-    conn = sqlite3.connect(DB_PATH)
-    cur  = conn.cursor()
-    cur.execute("SELECT entry, sl, tp, signal_type FROM signals WHERE id=?", (sig_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-
-    entry, sl, tp, stype = row
-    if result == "TP":
-        pnl_pct = RR_RATIO * 1.0  # +3%
-        pnl_usd = risk_usd * RR_RATIO
-    else:
-        pnl_pct = -1.0             # -1%
-        pnl_usd = -risk_usd
-
-    cur.execute("""
-        UPDATE signals
-        SET status='CLOSED', result=?, pnl_pct=?, pnl_usd=?, close_time=?
-        WHERE id=?
-    """, (
-        result, pnl_pct, pnl_usd,
-        datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        sig_id
-    ))
-    conn.commit()
-    conn.close()
+def update_result(sid: int, result: str):
+    pnl_usd = RISK_PER_TRADE_USD * RR_RATIO if result=="TP" else -RISK_PER_TRADE_USD
+    pnl_pct = pnl_usd / ACCOUNT_BALANCE * 100
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("UPDATE signals SET status='CLOSED',result=?,pnl_pct=?,pnl_usd=?,close_time=? WHERE id=?",
+        (result,pnl_pct,pnl_usd,datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),sid))
+    conn.commit(); conn.close()
 
 def get_daily_stats(date_str: str) -> dict:
-    """Ambil statistik harian dari database, termasuk streak & drawdown."""
-    conn = sqlite3.connect(DB_PATH)
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT strategy, asset, result, pnl_pct, pnl_usd, close_time
-        FROM signals
-        WHERE DATE(timestamp) = ? AND status = 'CLOSED'
-        ORDER BY close_time ASC
-    """, (date_str,))
-    rows = cur.fetchall()
-    conn.close()
-
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("""SELECT strategy,pair,result,pnl_pct,pnl_usd FROM signals
+        WHERE DATE(timestamp)=? AND status='CLOSED' ORDER BY close_time""", (date_str,))
+    rows = cur.fetchall(); conn.close()
     stats = {}
-    for strategy, asset, result, pnl_pct, pnl_usd, close_time in rows:
-        key = (strategy, asset)
-        if key not in stats:
-            stats[key] = {
-                "win": 0, "loss": 0,
-                "pnl_pct": 0.0, "pnl_usd": 0.0,
-                "results": [],          # urutan hasil untuk hitung streak
-                "max_losestreak": 0,    # losestreak terpanjang
-                "max_winstreak": 0,     # winstreak terpanjang
-                "max_drawdown_pct": 0.0, # drawdown maksimum (%)
-                "max_drawdown_usd": 0.0,
-            }
-        s = stats[key]
-        if result == "TP":
-            s["win"] += 1
-        else:
-            s["loss"] += 1
-        s["pnl_pct"] += pnl_pct or 0.0
-        s["pnl_usd"] += pnl_usd or 0.0
+    for strategy, pair, result, pnl_pct, pnl_usd in rows:
+        k = (strategy, pair)
+        if k not in stats:
+            stats[k] = {"win":0,"loss":0,"pnl_pct":0.0,"pnl_usd":0.0,
+                        "results":[],"max_ls":0,"max_ws":0,"max_dd":0.0}
+        s = stats[k]
+        if result=="TP": s["win"]+=1
+        else: s["loss"]+=1
+        s["pnl_pct"]+=pnl_pct or 0; s["pnl_usd"]+=pnl_usd or 0
         s["results"].append(result)
-
-    # Hitung streak dan drawdown dari urutan hasil
-    for key, s in stats.items():
-        results = s["results"]
-        cur_lose = cur_win = 0
-        max_lose = max_win = 0
-        cur_dd_pct = cur_dd_usd = 0.0
-        max_dd_pct = max_dd_usd = 0.0
-
-        for r in results:
-            if r == "SL":
-                cur_lose += 1
-                cur_win   = 0
-                cur_dd_pct += 1.0   # -1% per SL
-                cur_dd_usd += 100.0 # asumsi risk $100
-                max_dd_pct = max(max_dd_pct, cur_dd_pct)
-                max_dd_usd = max(max_dd_usd, cur_dd_usd)
-            else:
-                cur_win  += 1
-                cur_lose  = 0
-                cur_dd_pct = 0.0  # reset drawdown saat TP
-                cur_dd_usd = 0.0
-
-            max_lose = max(max_lose, cur_lose)
-            max_win  = max(max_win, cur_win)
-
-        s["max_losestreak"]   = max_lose
-        s["max_winstreak"]    = max_win
-        s["max_drawdown_pct"] = max_dd_pct
-        s["max_drawdown_usd"] = max_dd_usd
-
+    for s in stats.values():
+        cl=cw=0; ml=mw=0; cd=md=0.0
+        for r in s["results"]:
+            if r=="SL": cl+=1;cw=0;cd+=RISK_PER_TRADE_USD;md=max(md,cd)
+            else: cw+=1;cl=0;cd=0.0
+            ml=max(ml,cl);mw=max(mw,cw)
+        s["max_ls"]=ml;s["max_ws"]=mw;s["max_dd"]=md
     return stats
 
 def get_alltime_streak() -> dict:
-    """
-    Hitung losestreak dan drawdown sepanjang waktu dari semua closed trades.
-    Dipakai untuk alert real-time saat losestreak terjadi.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT strategy, asset, result, pnl_usd
-        FROM signals
-        WHERE status = 'CLOSED'
-        ORDER BY close_time ASC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    streaks = {}
-    for strategy, asset, result, pnl_usd in rows:
-        key = (strategy, asset)
-        if key not in streaks:
-            streaks[key] = {
-                "cur_lose": 0, "cur_win": 0,
-                "max_lose": 0, "max_win": 0,
-                "cur_dd_usd": 0.0, "max_dd_usd": 0.0,
-            }
-        s = streaks[key]
-        if result == "SL":
-            s["cur_lose"]   += 1
-            s["cur_win"]     = 0
-            s["cur_dd_usd"] += abs(pnl_usd or 100.0)
-            s["max_dd_usd"]  = max(s["max_dd_usd"], s["cur_dd_usd"])
-        else:
-            s["cur_win"]    += 1
-            s["cur_lose"]    = 0
-            s["cur_dd_usd"]  = 0.0
-        s["max_lose"] = max(s["max_lose"], s["cur_lose"])
-        s["max_win"]  = max(s["max_win"], s["cur_win"])
-
-    return streaks
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("SELECT strategy,pair,result FROM signals WHERE status='CLOSED' ORDER BY close_time")
+    rows = cur.fetchall(); conn.close()
+    sk = {}
+    for strategy, pair, result in rows:
+        k = (strategy, pair)
+        if k not in sk: sk[k] = {"cl":0,"cw":0,"cd":0.0,"md":0.0}
+        s = sk[k]
+        if result=="SL": s["cl"]+=1;s["cw"]=0;s["cd"]+=RISK_PER_TRADE_USD;s["md"]=max(s["md"],s["cd"])
+        else: s["cw"]+=1;s["cl"]=0;s["cd"]=0.0
+    return sk
 
 # ============================================================
-# 📡  BINANCE DATA FETCHER via CCXT
+# DATA FETCHER
 # ============================================================
-# ── Mapping symbol ccxt → Binance REST format ─────────────────────────────────
-# ccxt pakai "BTC/USDT", Binance REST pakai "BTCUSDT"
-def to_binance_symbol(symbol: str) -> str:
-    return symbol.replace("/", "")
+def pip(pair): return PIP_SIZE.get(pair, 0.0001)
+def p2price(pair, n): return n * pip(pair)
+def price2p(pair, diff): return abs(diff) / pip(pair)
 
-# ── Mapping timeframe label → Binance interval string ─────────────────────────
-TF_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h"}
+def calc_lot(pair, pips_r) -> float:
+    lpv = LOT_VALUE_PER_PIP.get(pair, 0.001)
+    if pips_r <= 0 or lpv <= 0: return 0.01
+    lot = RISK_PER_TRADE_USD / (pips_r * lpv)
+    return max(0.01, round(lot / 0.01) * 0.01)
 
-def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame | None:
-    """
-    Fetch OHLCV dari Binance Vision REST API.
-    Tidak ada geo-block, tidak butuh API key.
-    Candle terakhir (live) dibuang otomatis.
-    """
-    bn_symbol = to_binance_symbol(symbol)
-    interval  = TF_MAP.get(timeframe, timeframe)
-
-    for attempt in range(1, MAX_RETRIES + 1):
+def fetch_twelve(sym_td, interval, limit=80):
+    for attempt in range(1, MAX_RETRIES+1):
         try:
-            resp = requests.get(
-                BINANCE_KLINES_URL,
-                params={"symbol": bn_symbol, "interval": interval, "limit": limit + 1},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            raw = resp.json()
-
-            if not isinstance(raw, list) or len(raw) < 3:
-                return None
-
-            data = [
-                [int(r[0]), float(r[1]), float(r[2]),
-                 float(r[3]), float(r[4]), float(r[5])]
-                for r in raw
-            ]
-            df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            return df.iloc[:-1].reset_index(drop=True)  # buang candle live
-
-        except requests.exceptions.RequestException as e:
-            log.warning(f"  ⚠️ Fetch {symbol} {timeframe} gagal (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(5)
-
-    log.error(f"❌ Fetch {symbol} {timeframe} gagal setelah {MAX_RETRIES} attempts.")
-    return None
-
-def get_current_price(symbol: str) -> float | None:
-    """Ambil harga terkini dari Binance Vision REST API."""
-    bn_symbol = to_binance_symbol(symbol)
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.get(
-                BINANCE_TICKER_URL,
-                params={"symbol": bn_symbol},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return float(resp.json()["price"])
+            r = requests.get(TWELVE_DATA_URL, params={
+                "symbol":sym_td,"interval":interval,
+                "outputsize":limit+1,"apikey":TWELVE_DATA_KEY,"format":"JSON"
+            }, timeout=15); r.raise_for_status()
+            d = r.json()
+            if "values" not in d:
+                log.warning(f"Twelve Data {sym_td}: {d.get('message','no data')}"); return None
+            df = pd.DataFrame(d["values"]).rename(columns={"datetime":"timestamp"})
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            for c in ["open","high","low","close","volume"]:
+                df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            return df.iloc[:-1]
         except Exception as e:
-            log.warning(f"  ⚠️ Harga {symbol} gagal (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(3)
+            log.warning(f"Twelve {sym_td} {interval} attempt {attempt}: {e}")
+            if attempt < MAX_RETRIES: time.sleep(5)
     return None
 
+def fetch_binance(sym_bn, interval, limit=80):
+    for attempt in range(1, MAX_RETRIES+1):
+        try:
+            r = requests.get(BINANCE_KLINES_URL,
+                params={"symbol":sym_bn,"interval":interval,"limit":limit+1},timeout=15)
+            r.raise_for_status(); raw = r.json()
+            if not isinstance(raw,list) or len(raw)<3: return None
+            df = pd.DataFrame([[int(x[0]),float(x[1]),float(x[2]),
+                                float(x[3]),float(x[4]),float(x[5])] for x in raw],
+                              columns=["timestamp","open","high","low","close","volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"],unit="ms",utc=True)
+            return df.iloc[:-1].reset_index(drop=True)
+        except Exception as e:
+            log.warning(f"Binance {sym_bn} {interval} attempt {attempt}: {e}")
+            if attempt < MAX_RETRIES: time.sleep(5)
+    return None
+
+def fetch_ohlcv(asset, tf_td, tf_bn, limit=80):
+    if asset["source"]=="binance": return fetch_binance(asset["sym_bn"], tf_bn, limit)
+    return fetch_twelve(asset["sym_td"], tf_td, limit)
+
+def get_price(asset):
+    try:
+        if asset["source"]=="binance":
+            r = requests.get(BINANCE_TICKER_URL,params={"symbol":asset["sym_bn"]},timeout=10)
+            return float(r.json()["price"])
+        r = requests.get(TWELVE_PRICE_URL,
+            params={"symbol":asset["sym_td"],"apikey":TWELVE_DATA_KEY},timeout=10)
+        return float(r.json()["price"])
+    except: return None
+
 # ============================================================
-# 📐  INDIKATOR TEKNIKAL
+# INDICATORS
 # ============================================================
-def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """ATR menggunakan pandas_ta."""
-    atr = ta.atr(df["high"], df["low"], df["close"], length=period)
-    return atr
+def atr(df, p=14): return ta.atr(df["high"],df["low"],df["close"],length=p)
+def ema(df, p): return df["close"].ewm(span=p,adjust=False).mean()
+def ma(df, p): return df["close"].rolling(p).mean()
 
-def detect_fractals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Deteksi Fractal High dan Fractal Low (Williams Fractal).
-    Fractal High: candle[i].high > candle[i-2, i-1, i+1, i+2].high
-    Fractal Low:  candle[i].low  < candle[i-2, i-1, i+1, i+2].low
-
-    Returns df dengan kolom fractal_high dan fractal_low.
-    """
-    df = df.copy()
-    df["fractal_high"] = False
-    df["fractal_low"]  = False
-
-    for i in range(2, len(df) - 2):
-        h = df["high"].iloc
-        l = df["low"].iloc
-
-        if (h[i] > h[i-1] and h[i] > h[i-2] and
-                h[i] > h[i+1] and h[i] > h[i+2]):
-            df.at[df.index[i], "fractal_high"] = True
-
-        if (l[i] < l[i-1] and l[i] < l[i-2] and
-                l[i] < l[i+1] and l[i] < l[i+2]):
-            df.at[df.index[i], "fractal_low"] = True
-
+def fractals(df):
+    df = df.copy(); df["fh"]=False; df["fl"]=False
+    for i in range(2,len(df)-2):
+        h=df["high"].iloc; l=df["low"].iloc
+        if h[i]>h[i-1] and h[i]>h[i-2] and h[i]>h[i+1] and h[i]>h[i+2]:
+            df.at[df.index[i],"fh"]=True
+        if l[i]<l[i-1] and l[i]<l[i-2] and l[i]<l[i+1] and l[i]<l[i+2]:
+            df.at[df.index[i],"fl"]=True
     return df
 
+def vol_ok(df, lb=VOLUME_LOOKBACK):
+    if len(df)<lb+1: return False
+    avg=df["volume"].iloc[-(lb+1):-1].mean()
+    return df["volume"].iloc[-1]>avg if avg>0 else False
+
 # ============================================================
-# 🏗️  STRATEGI 1: SUPPLY & DEMAND CLASSIC
+# SPREAD HELPERS
 # ============================================================
-def detect_sd_zones(df_30m: pd.DataFrame) -> list[dict]:
-    """
-    Deteksi zona Supply & Demand di 30M.
+def e_buy(pair,price): return price + p2price(pair,SPREAD_PIPS)
+def e_sell(pair,price): return price - p2price(pair,SPREAD_PIPS)
+def sl_buy_f(pair,raw): return raw - p2price(pair,SPREAD_PIPS)
+def sl_sell_f(pair,raw): return raw + p2price(pair,SPREAD_PIPS)
+def calc_tp(entry,sl):
+    risk=abs(entry-sl)
+    return entry+risk*RR_RATIO if entry>sl else entry-risk*RR_RATIO
 
-    Kriteria zona valid:
-    1. Fresh / Unmitigated — harga belum masuk kembali ke zona
-    2. Strong Leg Out — candle keluar zona ≥ 1.5× ATR
-    3. Struktur: Leg In → Base → Leg Out yang jelas
+# ============================================================
+# STRATEGI 1 — IMBALANCE + FRACTAL + EMA21/50
+# ============================================================
+def s1_zones(df30, pair):
+    if df30 is None or len(df30)<EMA_SLOW+5: return []
+    atr_s=atr(df30); e21=ema(df30,EMA_FAST); e50=ema(df30,EMA_SLOW)
+    fr=fractals(df30); zones=[]
+    for i in range(3,len(df30)-1):
+        av=atr_s.iloc[i]
+        if pd.isna(av) or av<=0: continue
+        c1,c2,c3=df30.iloc[i-2],df30.iloc[i-1],df30.iloc[i]
+        up=e21.iloc[i]>e50.iloc[i]; dn=e21.iloc[i]<e50.iloc[i]
+        # Bullish imbalance
+        if (up and c1["close"]<c1["open"] and c3["close"]>c3["open"]
+                and c2["low"]>c1["high"]
+                and (c3["high"]-c1["low"])>=STRONG_LEG_MULT*av):
+            fp=next((df30["low"].iloc[j] for j in range(i-1,max(0,i-20),-1)
+                     if fr["fl"].iloc[j]),None)
+            il,ih=c1["high"],c2["high"]
+            if all(df30["low"].iloc[j]>il for j in range(i+1,len(df30))):
+                zones.append({"type":"BULL","sig":"BUY","zh":ih,"zl":il,"fp":fp,"av":av,"i":i,"trend":"UPTREND"})
+        # Bearish imbalance
+        elif (dn and c1["close"]>c1["open"] and c3["close"]<c3["open"]
+                and c2["high"]<c1["low"]
+                and (c1["high"]-c3["low"])>=STRONG_LEG_MULT*av):
+            fp=next((df30["high"].iloc[j] for j in range(i-1,max(0,i-20),-1)
+                     if fr["fh"].iloc[j]),None)
+            ih,il=c1["low"],c2["low"]
+            if all(df30["high"].iloc[j]<ih for j in range(i+1,len(df30))):
+                zones.append({"type":"BEAR","sig":"SELL","zh":ih,"zl":il,"fp":fp,"av":av,"i":i,"trend":"DOWNTREND"})
+    return zones[-5:]
 
-    Returns: list of zone dict
-    {
-      type: "DEMAND" | "SUPPLY",
-      zone_high: float,
-      zone_low: float,
-      leg_out_size: float,
-      atr: float,
-      timestamp: str,
-    }
-    """
-    if df_30m is None or len(df_30m) < ATR_PERIOD + 5:
-        return []
-
-    atr_series = calc_atr(df_30m, ATR_PERIOD)
-    zones      = []
-
-    for i in range(3, len(df_30m) - 1):
-        atr_val = atr_series.iloc[i]
-        if pd.isna(atr_val) or atr_val <= 0:
-            continue
-
-        candle = df_30m.iloc[i]
-        prev1  = df_30m.iloc[i - 1]
-        prev2  = df_30m.iloc[i - 2]
-
-        # ── Cek struktur Leg In → Base → Leg Out ──────────────────────────────
-        # Leg In:  candle[i-2] bergerak kuat ke satu arah
-        # Base:    candle[i-1] kecil (konsolidasi / doji)
-        # Leg Out: candle[i] bergerak kuat ke arah berlawanan
-
-        body_prev2 = abs(prev2["close"] - prev2["open"])
-        body_prev1 = abs(prev1["close"] - prev1["open"])
-        body_curr  = abs(candle["close"] - candle["open"])
-
-        # Base harus kecil (body < 0.5× ATR)
-        if body_prev1 > 0.5 * atr_val:
-            continue
-
-        # Leg Out harus besar (≥ STRONG_LEG_MULT × ATR)
-        leg_out_size = candle["high"] - candle["low"]
-        if leg_out_size < STRONG_LEG_MULT * atr_val:
-            continue
-
-        ts_str = str(df_30m["timestamp"].iloc[i])
-
-        # ── DEMAND ZONE: Leg In turun → Base → Leg Out naik ──────────────────
-        if (prev2["close"] < prev2["open"] and   # leg in = bearish
-                candle["close"] > candle["open"] and  # leg out = bullish
-                candle["close"] > prev2["open"]):    # leg out lebih tinggi
-
-            zone_low  = min(prev1["low"],  candle["low"])
-            zone_high = max(prev1["high"], candle["open"])
-
-            # Cek fresh: harga setelah zona tidak masuk kembali ke zona
-            is_fresh = True
-            for j in range(i + 1, len(df_30m)):
-                if df_30m["low"].iloc[j] <= zone_high:
-                    is_fresh = False
-                    break
-
-            if is_fresh:
-                zones.append({
-                    "type":        "DEMAND",
-                    "zone_high":   zone_high,
-                    "zone_low":    zone_low,
-                    "leg_out_size": leg_out_size,
-                    "atr":         atr_val,
-                    "timestamp":   ts_str,
-                    "index":       i,
-                })
-
-        # ── SUPPLY ZONE: Leg In naik → Base → Leg Out turun ──────────────────
-        elif (prev2["close"] > prev2["open"] and  # leg in = bullish
-                candle["close"] < candle["open"] and  # leg out = bearish
-                candle["close"] < prev2["open"]):    # leg out lebih rendah
-
-            zone_high = max(prev1["high"], candle["high"])
-            zone_low  = min(prev1["low"],  candle["open"])
-
-            is_fresh = True
-            for j in range(i + 1, len(df_30m)):
-                if df_30m["high"].iloc[j] >= zone_low:
-                    is_fresh = False
-                    break
-
-            if is_fresh:
-                zones.append({
-                    "type":        "SUPPLY",
-                    "zone_high":   zone_high,
-                    "zone_low":    zone_low,
-                    "leg_out_size": leg_out_size,
-                    "atr":         atr_val,
-                    "timestamp":   ts_str,
-                    "index":       i,
-                })
-
-    return zones
-
-def check_strategy1_entry(
-    symbol: str, asset_name: str, zones: list[dict],
-    df_5m: pd.DataFrame, df_1m: pd.DataFrame
-) -> dict | None:
-    """
-    Konfirmasi entry Strategi 1 di 5M dan 1M.
-
-    1. Harga mendekati zona 30M (dalam zona ± 0.1% dari zone_high/low)
-    2. Di 5M: ada rejection candle (wick panjang) atau engulfing
-    3. Di 1M: candle penutup melewati high/low candle sebelumnya (trigger)
-    """
-    if df_5m is None or df_1m is None or not zones:
-        return None
-
-    price_5m = df_5m["close"].iloc[-1]
-
-    for zone in zones:
-        zh = zone["zone_high"]
-        zl = zone["zone_low"]
-
-        # Cek apakah harga mendekati zona
-        if zone["type"] == "DEMAND":
-            in_zone = zl * (1 - ZONE_FRESH_BUFFER) <= price_5m <= zh * (1 + ZONE_FRESH_BUFFER)
+def s1_entry(pair, zones, df5, df1):
+    if not zones or df5 is None or df1 is None: return None
+    av5=atr(df5); av5v=float(av5.iloc[-1]) if not pd.isna(av5.iloc[-1]) else 0
+    fr5=fractals(df5); p5=df5["close"].iloc[-1]; vok=vol_ok(df5)
+    for z in reversed(zones):
+        buf=z["av"]*0.2
+        if not((z["zl"]-buf)<=p5<=(z["zh"]+buf)): continue
+        # Refine to TF5 fractal
+        ref=None
+        for j in range(len(df5)-3,max(0,len(df5)-25),-1):
+            if z["sig"]=="BUY" and fr5["fl"].iloc[j] and z["zl"]<=df5["low"].iloc[j]<=z["zh"]:
+                ref=df5["low"].iloc[j]; break
+            elif z["sig"]=="SELL" and fr5["fh"].iloc[j] and z["zl"]<=df5["high"].iloc[j]<=z["zh"]:
+                ref=df5["high"].iloc[j]; break
+        if ref is None: ref=z["zl"] if z["sig"]=="BUY" else z["zh"]
+        # TF5 rejection
+        l5=df5.iloc[-1]; r5=l5["high"]-l5["low"]; b5=abs(l5["close"]-l5["open"])
+        wr=(r5-b5)/r5 if r5>0 else 0
+        rej=((z["sig"]=="BUY" and wr>=0.5 and l5["close"]>l5["open"]) or
+             (z["sig"]=="SELL" and wr>=0.5 and l5["close"]<l5["open"]))
+        if not rej and not vok: continue
+        if z["sig"]=="BUY":
+            e=e_buy(pair,ref); rsl=df1["low"].iloc[-5:].min()-av5v
+            s=sl_buy_f(pair,rsl); risk=e-s
         else:
-            in_zone = zl * (1 - ZONE_FRESH_BUFFER) <= price_5m <= zh * (1 + ZONE_FRESH_BUFFER)
-
-        if not in_zone:
-            continue
-
-        # Konfirmasi 5M: cari rejection candle
-        last_5m  = df_5m.iloc[-1]
-        body_5m  = abs(last_5m["close"] - last_5m["open"])
-        range_5m = last_5m["high"] - last_5m["low"]
-        wick_ratio = (range_5m - body_5m) / range_5m if range_5m > 0 else 0
-
-        confirmed_5m = False
-        if zone["type"] == "DEMAND" and wick_ratio >= 0.6 and last_5m["close"] > last_5m["open"]:
-            confirmed_5m = True
-        elif zone["type"] == "SUPPLY" and wick_ratio >= 0.6 and last_5m["close"] < last_5m["open"]:
-            confirmed_5m = True
-
-        if not confirmed_5m:
-            continue
-
-        # Trigger 1M: candle bullish melewati high sebelumnya (demand)
-        # atau candle bearish melewati low sebelumnya (supply)
-        last_1m = df_1m.iloc[-1]
-        prev_1m = df_1m.iloc[-2]
-        triggered = False
-
-        if zone["type"] == "DEMAND" and last_1m["close"] > prev_1m["high"]:
-            triggered = True
-        elif zone["type"] == "SUPPLY" and last_1m["close"] < prev_1m["low"]:
-            triggered = True
-
-        if not triggered:
-            continue
-
-        # Hitung entry, SL, TP
-        if zone["type"] == "DEMAND":
-            entry  = last_1m["close"]
-            sl     = zl * (1 - 0.0005)   # SL di bawah zona dengan buffer kecil
-            risk   = entry - sl
-            tp     = entry + risk * RR_RATIO
-            stype  = "LONG"
-        else:
-            entry  = last_1m["close"]
-            sl     = zh * (1 + 0.0005)
-            risk   = sl - entry
-            tp     = entry - risk * RR_RATIO
-            stype  = "SHORT"
-
-        return {
-            "strategy":   "STRATEGI 1 - S/D Classic",
-            "asset":      asset_name,
-            "symbol":     symbol,
-            "type":       stype,
-            "entry":      entry,
-            "sl":         sl,
-            "tp":         tp,
-            "zone":       zone,
-            "tf_confirm": f"{TF_HIGH} zone / {TF_MID} rejection / {TF_LOW} trigger",
-        }
-
+            e=e_sell(pair,ref); rsl=df1["high"].iloc[-5:].max()+av5v
+            s=sl_sell_f(pair,rsl); risk=s-e
+        if risk<=0: continue
+        t=calc_tp(e,s); pr=price2p(pair,risk); lot=calc_lot(pair,pr)
+        return {"strategy":"S1-Imbalance+Fractal+EMA","sig":z["sig"],"pair":pair,
+                "entry":e,"sl":s,"tp":t,"lot":lot,"pr":pr,
+                "zh":z["zh"],"zl":z["zl"],"trend":z["trend"],
+                "tf_confirm":"TF30 EMA+IMB / TF5 Fractal / TF1 limit",
+                "notes":f"IMB {z['type']} frac@{z['fp']:.5f}" if z["fp"] else f"IMB {z['type']}"}
     return None
 
 # ============================================================
-# 🏗️  STRATEGI 2: FRACTAL SCALPING SET & FORGET
+# STRATEGI 2 — S&D RBR/DBR/DBD/RBD
 # ============================================================
-def detect_order_blocks(df_30m: pd.DataFrame) -> list[dict]:
-    """
-    Deteksi Order Block di 30M.
-    Order Block = candle terakhir yang berlawanan arah sebelum
-    pergerakan impulsif (strong move).
+def s2_zones(df30, pair):
+    if df30 is None or len(df30)<ATR_PERIOD+8: return []
+    atr_s=atr(df30); zones=[]
+    for i in range(3,len(df30)-2):
+        av=atr_s.iloc[i]
+        if pd.isna(av) or av<=0: continue
+        cl,cb,co=df30.iloc[i-2],df30.iloc[i-1],df30.iloc[i]
+        bb=abs(cb["close"]-cb["open"]); om=co["high"]-co["low"]
+        if bb>0.5*av or om<STRONG_LEG_MULT*av: continue
+        if co["close"]>co["open"]:  # demand
+            zh=max(cb["high"],co["open"]); zl=min(cb["low"],co["open"]*0.999)
+            fvg=co["low"]>cl["high"]*0.998
+            ph=df30["high"].iloc[max(0,i-10):i].max()
+            bos=any(df30["high"].iloc[j]>ph for j in range(i+1,min(i+5,len(df30))))
+            if not(fvg or bos): continue
+            fresh=all(df30["low"].iloc[j]>zl for j in range(i+1,len(df30)))
+            patt="RBR" if cl["close"]>cl["open"] else "DBR"
+            if fresh: zones.append({"type":"DEMAND","patt":patt,"sig":"BUY","zh":zh,"zl":zl,"av":av,"i":i})
+        elif co["close"]<co["open"]:  # supply
+            zl=min(cb["low"],co["open"]); zh=max(cb["high"],co["open"]*1.001)
+            fvg=co["high"]<cl["low"]*1.002
+            pl=df30["low"].iloc[max(0,i-10):i].min()
+            bos=any(df30["low"].iloc[j]<pl for j in range(i+1,min(i+5,len(df30))))
+            if not(fvg or bos): continue
+            fresh=all(df30["high"].iloc[j]<zh for j in range(i+1,len(df30)))
+            patt="DBD" if cl["close"]<cl["open"] else "RBD"
+            if fresh: zones.append({"type":"SUPPLY","patt":patt,"sig":"SELL","zh":zh,"zl":zl,"av":av,"i":i})
+    return zones[-5:]
 
-    Dikombinasikan dengan Fractal untuk filter kualitas tinggi.
-    """
-    if df_30m is None or len(df_30m) < ATR_PERIOD + 5:
-        return []
-
-    atr_series = calc_atr(df_30m, ATR_PERIOD)
-    df_frac    = detect_fractals(df_30m)
-    obs        = []
-
-    for i in range(2, len(df_30m) - 1):
-        atr_val = atr_series.iloc[i]
-        if pd.isna(atr_val) or atr_val <= 0:
-            continue
-
-        curr  = df_30m.iloc[i]
-        prev  = df_30m.iloc[i - 1]
-        next_ = df_30m.iloc[i + 1] if i + 1 < len(df_30m) else None
-
-        if next_ is None:
-            continue
-
-        # Move impulsif setelah candle ini
-        next_move = next_["high"] - next_["low"]
-
-        # ── Bullish Order Block ────────────────────────────────────────────────
-        # Candle[i] bearish → candle[i+1] bullish impulsif (≥ 1.5× ATR)
-        if (curr["close"] < curr["open"] and
-                next_["close"] > next_["open"] and
-                next_move >= STRONG_LEG_MULT * atr_val):
-
-            # Diperkuat jika ada Fractal Low di dekat area ini
-            near_fractal = df_frac["fractal_low"].iloc[max(0, i-3):i+1].any()
-
-            ob_high = curr["high"]
-            ob_low  = curr["low"]
-
-            # Fresh check
-            is_fresh = True
-            for j in range(i + 2, len(df_30m)):
-                if df_30m["low"].iloc[j] <= ob_low:
-                    is_fresh = False
-                    break
-
-            obs.append({
-                "type":      "BULLISH_OB",
-                "ob_high":   ob_high,
-                "ob_low":    ob_low,
-                "atr":       atr_val,
-                "fractal":   near_fractal,
-                "quality":   "HIGH" if near_fractal else "MEDIUM",
-                "fresh":     is_fresh,
-                "timestamp": str(df_30m["timestamp"].iloc[i]),
-                "index":     i,
-            })
-
-        # ── Bearish Order Block ────────────────────────────────────────────────
-        elif (curr["close"] > curr["open"] and
-                next_["close"] < next_["open"] and
-                next_move >= STRONG_LEG_MULT * atr_val):
-
-            near_fractal = df_frac["fractal_high"].iloc[max(0, i-3):i+1].any()
-
-            ob_high = curr["high"]
-            ob_low  = curr["low"]
-
-            is_fresh = True
-            for j in range(i + 2, len(df_30m)):
-                if df_30m["high"].iloc[j] >= ob_high:
-                    is_fresh = False
-                    break
-
-            obs.append({
-                "type":      "BEARISH_OB",
-                "ob_high":   ob_high,
-                "ob_low":    ob_low,
-                "atr":       atr_val,
-                "fractal":   near_fractal,
-                "quality":   "HIGH" if near_fractal else "MEDIUM",
-                "fresh":     is_fresh,
-                "timestamp": str(df_30m["timestamp"].iloc[i]),
-                "index":     i,
-            })
-
-    # Kembalikan hanya yang fresh
-    return [ob for ob in obs if ob["fresh"]]
-
-def check_strategy2_entry(
-    symbol: str, asset_name: str, obs: list[dict],
-    df_5m: pd.DataFrame, df_1m: pd.DataFrame
-) -> dict | None:
-    """
-    Konfirmasi entry Strategi 2 di 5M (Fractal) dan 1M (trigger).
-
-    Filter tambahan vs Strategi 1:
-    - Hanya ambil Order Block berkualitas HIGH (ada Fractal nearby)
-    - 5M: Fractal Low/High di dalam OB area
-    - 1M: Candle trigger dengan volume konfirmasi
-    """
-    if df_5m is None or df_1m is None or not obs:
-        return None
-
-    df_5m_frac = detect_fractals(df_5m)
-    price_5m   = df_5m["close"].iloc[-1]
-
-    for ob in obs:
-        # Prioritaskan OB berkualitas HIGH
-        if ob["quality"] != "HIGH":
-            continue
-
-        # Cek harga mendekati OB
-        buffer = ob["atr"] * 0.3
-        near_ob = ob["ob_low"] - buffer <= price_5m <= ob["ob_high"] + buffer
-
-        if not near_ob:
-            continue
-
-        # ── Konfirmasi 5M: ada Fractal Low di area OB Bullish ─────────────────
-        if ob["type"] == "BULLISH_OB":
-            # Cari fractal low di 5M yang berada dalam OB range
-            frac_in_ob = False
-            for i, row in df_5m.iterrows():
-                if df_5m_frac["fractal_low"].iloc[i] and ob["ob_low"] <= row["low"] <= ob["ob_high"]:
-                    frac_in_ob = True
-                    break
-
-            if not frac_in_ob:
-                continue
-
-            # Trigger 1M: candle bullish break previous high
-            last_1m = df_1m.iloc[-1]
-            prev_1m = df_1m.iloc[-2]
-            if not (last_1m["close"] > prev_1m["high"] and last_1m["close"] > last_1m["open"]):
-                continue
-
-            entry = last_1m["close"]
-            sl    = ob["ob_low"] * (1 - 0.0003)
-            risk  = entry - sl
-            tp    = entry + risk * RR_RATIO
-
-            return {
-                "strategy":   "STRATEGI 2 - Fractal Scalping",
-                "asset":      asset_name,
-                "symbol":     symbol,
-                "type":       "LONG",
-                "entry":      entry,
-                "sl":         sl,
-                "tp":         tp,
-                "ob":         ob,
-                "tf_confirm": f"{TF_HIGH} OB / {TF_MID} Fractal / {TF_LOW} trigger",
-                "quality":    ob["quality"],
-            }
-
-        # ── Konfirmasi 5M: ada Fractal High di area OB Bearish ────────────────
-        elif ob["type"] == "BEARISH_OB":
-            frac_in_ob = False
-            for i, row in df_5m.iterrows():
-                if df_5m_frac["fractal_high"].iloc[i] and ob["ob_low"] <= row["high"] <= ob["ob_high"]:
-                    frac_in_ob = True
-                    break
-
-            if not frac_in_ob:
-                continue
-
-            last_1m = df_1m.iloc[-1]
-            prev_1m = df_1m.iloc[-2]
-            if not (last_1m["close"] < prev_1m["low"] and last_1m["close"] < last_1m["open"]):
-                continue
-
-            entry = last_1m["close"]
-            sl    = ob["ob_high"] * (1 + 0.0003)
-            risk  = sl - entry
-            tp    = entry - risk * RR_RATIO
-
-            return {
-                "strategy":   "STRATEGI 2 - Fractal Scalping",
-                "asset":      asset_name,
-                "symbol":     symbol,
-                "type":       "SHORT",
-                "entry":      entry,
-                "sl":         sl,
-                "tp":         tp,
-                "ob":         ob,
-                "tf_confirm": f"{TF_HIGH} OB / {TF_MID} Fractal / {TF_LOW} trigger",
-                "quality":    ob["quality"],
-            }
-
+def s2_entry(pair, zones, df5, df1):
+    if not zones or df5 is None or df1 is None: return None
+    av5=atr(df5); av5v=float(av5.iloc[-1]) if not pd.isna(av5.iloc[-1]) else 0
+    p5=df5["close"].iloc[-1]; vok=vol_ok(df5)
+    for z in reversed(zones):
+        zh,zl=z["zh"],z["zl"]; buf=z["av"]*0.15
+        if not((zl-buf)<=p5<=(zh+buf)): continue
+        mid=(zh+zl)/2
+        if z["sig"]=="BUY" and p5<mid: continue
+        if z["sig"]=="SELL" and p5>mid: continue
+        l5=df5.iloc[-1]; r5=l5["high"]-l5["low"]; b5=abs(l5["close"]-l5["open"])
+        wr=(r5-b5)/r5 if r5>0 else 0
+        rej=((z["sig"]=="BUY" and wr>=0.55 and l5["close"]>l5["open"]) or
+             (z["sig"]=="SELL" and wr>=0.55 and l5["close"]<l5["open"]))
+        if not rej and not vok: continue
+        if z["sig"]=="BUY":
+            e=e_buy(pair,zl); rsl=zl-av5v; s=sl_buy_f(pair,rsl); risk=e-s
+        else:
+            e=e_sell(pair,zh); rsl=zh+av5v; s=sl_sell_f(pair,rsl); risk=s-e
+        if risk<=0: continue
+        t=calc_tp(e,s); pr=price2p(pair,risk); lot=calc_lot(pair,pr)
+        return {"strategy":"S2-SD-RBR/DBD","sig":z["sig"],"pair":pair,
+                "entry":e,"sl":s,"tp":t,"lot":lot,"pr":pr,
+                "zh":zh,"zl":zl,"patt":z["patt"],
+                "tf_confirm":f"TF30 {z['patt']} / TF5 rej+FVG / TF1 trigger",
+                "notes":f"{z['patt']} demand/supply"}
     return None
 
 # ============================================================
-# 📨  TELEGRAM
+# STRATEGI 3 — MOMENTUM PULLBACK + OB + PA
 # ============================================================
-def send_telegram(message: str) -> bool:
-    if TELEGRAM_BOT_TOKEN == "your_token_here":
-        log.warning("Telegram token belum dikonfigurasi.")
-        return False
-    for attempt in range(1, MAX_RETRIES + 1):
+_entry_count = {}
+
+def s3_zones(df30, pair):
+    if df30 is None or len(df30)<MA_SLOW+5: return []
+    m9=ma(df30,MA_FAST); m21=ma(df30,MA_SLOW); zones=[]
+    for i in range(2,len(df30)-1):
+        if pd.isna(m9.iloc[i]) or pd.isna(m21.iloc[i]): continue
+        up=m9.iloc[i]>m21.iloc[i]; dn=m9.iloc[i]<m21.iloc[i]
+        cp,cc=df30.iloc[i-1],df30.iloc[i]
+        if (up and cp["close"]<cp["open"] and cc["close"]>cc["open"] and cc["close"]>cp["high"]):
+            zones.append({"type":"PB_BUY","sig":"BUY","zh":cc["high"],"zl":cp["low"],"trend":"UPTREND","i":i})
+        elif (dn and cp["close"]>cp["open"] and cc["close"]<cc["open"] and cc["close"]<cp["low"]):
+            zones.append({"type":"PB_SELL","sig":"SELL","zh":cp["high"],"zl":cc["low"],"trend":"DOWNTREND","i":i})
+    return zones[-5:]
+
+def s3_entry(pair, zones, df5, df1):
+    if not zones or df5 is None or df1 is None: return None
+    av5=atr(df5); av5v=float(av5.iloc[-1]) if not pd.isna(av5.iloc[-1]) else 0
+    p5=df5["close"].iloc[-1]; vok=vol_ok(df5)
+    for z in reversed(zones):
+        zh,zl=z["zh"],z["zl"]; zk=(pair,z["type"],z["i"])
+        if _entry_count.get(zk,0)>=2: continue
+        buf=av5v*0.5
+        if not((zl-buf)<=p5<=(zh+buf)): continue
+        ob_l=ob_h=None
+        for j in range(len(df5)-2,max(0,len(df5)-25),-1):
+            c5=df5.iloc[j]
+            if z["sig"]=="BUY" and c5["close"]<c5["open"] and zl<=c5["low"]<=zh:
+                ob_l=c5["low"]; ob_h=c5["high"]; break
+            elif z["sig"]=="SELL" and c5["close"]>c5["open"] and zl<=c5["high"]<=zh:
+                ob_l=c5["low"]; ob_h=c5["high"]; break
+        if ob_l is None or not vok: continue
+        l1,p1=df1.iloc[-1],df1.iloc[-2]
+        if z["sig"]=="BUY":
+            cfm=(l1["close"]>l1["open"] and l1["close"]>p1["high"] and p1["close"]<p1["open"]) or vok
+        else:
+            cfm=(l1["close"]<l1["open"] and l1["close"]<p1["low"] and p1["close"]>p1["open"]) or vok
+        if not cfm: continue
+        if z["sig"]=="BUY":
+            e=e_buy(pair,ob_l); rsl=df1["low"].iloc[-5:].min()-av5v
+            s=sl_buy_f(pair,rsl); risk=e-s
+        else:
+            e=e_sell(pair,ob_h); rsl=df1["high"].iloc[-5:].max()+av5v
+            s=sl_sell_f(pair,rsl); risk=s-e
+        if risk<=0: continue
+        t=calc_tp(e,s); pr=price2p(pair,risk); lot=calc_lot(pair,pr)
+        _entry_count[zk]=_entry_count.get(zk,0)+1; en=_entry_count[zk]
+        return {"strategy":"S3-Pullback+OB+PA","sig":z["sig"],"pair":pair,
+                "entry":e,"sl":s,"tp":t,"lot":lot,"pr":pr,
+                "zh":zh,"zl":zl,"ob_h":ob_h,"ob_l":ob_l,
+                "trend":z["trend"],"en":en,
+                "tf_confirm":"TF30 pullback / TF5 OB+Vol / TF1 PA",
+                "notes":f"PB {z['trend']} OB:{ob_l:.5f}-{ob_h:.5f} E{en}/2"}
+    return None
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+def send_tg(msg):
+    if TELEGRAM_BOT_TOKEN=="your_token_here": return False
+    for a in range(1,MAX_RETRIES+1):
         try:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id":    TELEGRAM_CHAT_ID,
-                    "text":       message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return True
-        except requests.exceptions.RequestException as e:
-            log.warning(f"  ⚠️ Telegram gagal (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(3)
+            r=requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML",
+                      "disable_web_page_preview":True},timeout=10)
+            r.raise_for_status(); return True
+        except Exception as e:
+            log.warning(f"Telegram attempt {a}: {e}")
+            if a<MAX_RETRIES: time.sleep(3)
     return False
 
 # ============================================================
-# 🏗️  BUILD MESSAGES
+# MESSAGES
 # ============================================================
-def build_signal_message(sig: dict) -> str:
-    now_str   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    # Konversi ke WIB (UTC+7)
-    wib_str   = (datetime.now(tz=timezone.utc) + timedelta(hours=7)).strftime("%H:%M WIB")
-    stype     = sig["type"]
-    arrow     = "🔼 LONG" if stype == "LONG" else "🔽 SHORT"
-    strategy  = sig["strategy"]
-    asset     = sig["asset"]
+def sig_msg(sig):
+    now=datetime.now(tz=timezone.utc)
+    wib=(now+timedelta(hours=7)).strftime("%H:%M WIB")
+    utc=now.strftime("%Y-%m-%d %H:%M UTC")
+    pair=sig["pair"]; s=sig["sig"]
+    arrow="🔼 BUY" if s=="BUY" else "🔽 SELL"
+    pr=sig.get("pr",0); pt=pr*RR_RATIO
+    lot=sig.get("lot",0.01); en=sig.get("en",1)
+    etag=f" [Entry {en}/2]" if en>1 else ""
+    zinfo=f"📦 Zone: ${sig.get('zl',0):.5f} – ${sig.get('zh',0):.5f}\n"
+    if sig.get("ob_h"): zinfo+=f"📦 OB  : ${sig.get('ob_l',0):.5f} – ${sig.get('ob_h',0):.5f}\n"
+    if sig.get("patt"): zinfo+=f"📋 Pola: {sig['patt']}\n"
+    if sig.get("trend"): zinfo+=f"📈 Tren: {sig['trend']}\n"
+    return (f"🚨 <b>[{sig['strategy']}]{etag}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💱 Pair     : <b>{pair}</b>\n"
+            f"📌 Signal   : <b>{arrow}</b>\n"
+            f"⏰ Waktu    : {utc} / {wib}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 <b>SETUP ENTRY (Limit Order)</b>\n"
+            f"💰 Entry    : <b>${sig['entry']:.5f}</b>\n"
+            f"🛑 Stop Loss: <b>${sig['sl']:.5f}</b> ({pr:.1f} pips)\n"
+            f"🎯 Take Profit: <b>${sig['tp']:.5f}</b> ({pt:.1f} pips)\n"
+            f"📐 RR       : 1:{RR_RATIO}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{zinfo}"
+            f"📐 Spread   : +{SPREAD_PIPS} pips (sudah dalam entry & SL)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 Lot      : <b>{lot:.2f} lot cent</b>\n"
+            f"💸 Risk     : ~${RISK_PER_TRADE_USD:.0f} ({RISK_PER_TRADE_USD/ACCOUNT_BALANCE*100:.1f}%)\n"
+            f"💵 Profit TP: ~${RISK_PER_TRADE_USD*RR_RATIO:.0f}\n"
+            f"🔍 Confirm  : {sig['tf_confirm']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <i>Pasang LIMIT ORDER di harga entry.\n"
+            f"Bukan market order — hindari telat entry.\n"
+            f"Bukan rekomendasi finansial.</i>")
 
-    entry = sig["entry"]
-    sl    = sig["sl"]
-    tp    = sig["tp"]
-    risk  = abs(entry - sl)
-    rr    = abs(tp - entry) / risk if risk > 0 else 0
+def result_msg(trade, result, price):
+    pnl=RISK_PER_TRADE_USD*RR_RATIO if result=="TP" else -RISK_PER_TRADE_USD
+    icon="🎯" if result=="TP" else "🛑"; sign="+" if pnl>0 else ""
+    return (f"{icon} <b>TRADE CLOSED — {result}</b>\n"
+            f"💱 {trade['pair']} | {'🔼 BUY' if trade['sig']=='BUY' else '🔽 SELL'}\n"
+            f"🎯 {trade['strategy']}\n"
+            f"💰 Entry: ${trade['entry']:.5f} → Close: ${price:.5f}\n"
+            f"💵 P&L : <b>{sign}${pnl:.2f}</b> ({sign}{pnl/ACCOUNT_BALANCE*100:.1f}%)\n"
+            f"🏦 Saldo est: ~${ACCOUNT_BALANCE+pnl:.0f}")
 
-    # Zona info
-    zone_info = ""
-    if "zone" in sig:
-        z = sig["zone"]
-        zone_info = (
-            f"📦 Zona {z['type']}: ${z['zone_low']:.4f} - ${z['zone_high']:.4f}\n"
-            f"   Leg Out: {z['leg_out_size']:.4f} ({z['leg_out_size']/z['atr']:.1f}× ATR)\n"
-        )
-    elif "ob" in sig:
-        ob = sig["ob"]
-        quality_icon = "⭐⭐" if ob["quality"] == "HIGH" else "⭐"
-        zone_info = (
-            f"📦 Order Block: ${ob['ob_low']:.4f} - ${ob['ob_high']:.4f}\n"
-            f"   Kualitas: {quality_icon} {ob['quality']} "
-            f"{'(+Fractal)' if ob['fractal'] else ''}\n"
-        )
-
-    return (
-        f"🚨 <b>[{strategy}]</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Aset      : <b>{asset}</b>\n"
-        f"📌 Sinyal    : <b>{arrow}</b>\n"
-        f"⏰ Waktu     : {now_str} / {wib_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Entry     : <b>${entry:.4f}</b>\n"
-        f"🛑 Stop Loss : ${sl:.4f} ({abs(entry-sl)/entry*100:.2f}%)\n"
-        f"🎯 Take Profit: ${tp:.4f} ({abs(tp-entry)/entry*100:.2f}%)\n"
-        f"📐 Risk:Reward: 1:{rr:.1f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{zone_info}"
-        f"🔍 TF Confirm: {sig['tf_confirm']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <i>Ini notifikasi sinyal, bukan rekomendasi finansial.\n"
-        f"Selalu gunakan risk management yang tepat.</i>"
-    )
-
-def build_daily_report(date_str: str, stats: dict) -> str:
-    wib_str = (datetime.now(tz=timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d")
-    msg     = f"📊 <b>DAILY REPORT — {wib_str} (07:00 WIB)</b>\n"
-    msg    += "━━━━━━━━━━━━━━━━━━━━━━\n"
-
-    total_win = total_loss = 0
-    total_pnl_pct = total_pnl_usd = 0.0
-    total_max_lose = total_max_dd = 0
-
-    for (strategy, asset), s in sorted(stats.items()):
-        total    = s["win"] + s["loss"]
-        wr       = (s["win"] / total * 100) if total > 0 else 0
-        total_win      += s["win"]
-        total_loss     += s["loss"]
-        total_pnl_pct  += s["pnl_pct"]
-        total_pnl_usd  += s["pnl_usd"]
-        total_max_lose  = max(total_max_lose, s["max_losestreak"])
-        total_max_dd    = max(total_max_dd,   s["max_drawdown_usd"])
-
-        strat_label = strategy.split(" - ")[1] if " - " in strategy else strategy
-        pnl_sign = "+" if s["pnl_pct"] >= 0 else ""
-
-        # Streak icons
-        lose_icon = "🔴" * min(s["max_losestreak"], 5)
-        win_icon  = "🟢" * min(s["max_winstreak"], 5)
-
-        msg += (
-            f"\n📌 <b>{strat_label} | {asset}</b>\n"
-            f"   Trade    : {total} (✅{s['win']} ❌{s['loss']})\n"
-            f"   WR       : {wr:.1f}%\n"
-            f"   PnL      : {pnl_sign}{s['pnl_pct']:.1f}% ({pnl_sign}${s['pnl_usd']:.2f})\n"
-            f"   Win streak: {win_icon} max {s['max_winstreak']}x\n"
-            f"   Lose streak: {lose_icon} max {s['max_losestreak']}x\n"
-            f"   Max DD   : -${s['max_drawdown_usd']:.0f} (-{s['max_drawdown_pct']:.0f}%)\n"
-        )
-
-    total_all = total_win + total_loss
-    wr_all    = (total_win / total_all * 100) if total_all > 0 else 0
-    pnl_sign  = "+" if total_pnl_pct >= 0 else ""
-
-    msg += (
-        f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>TOTAL SEMUA STRATEGI</b>\n"
-        f"   Trade    : {total_all} (✅{total_win} ❌{total_loss})\n"
-        f"   WR       : {wr_all:.1f}%\n"
-        f"   PnL      : {pnl_sign}{total_pnl_pct:.1f}% ({pnl_sign}${total_pnl_usd:.2f})\n"
-        f"   Max Losestreak: {'🔴'*min(total_max_lose,5)} {total_max_lose}x berturut\n"
-        f"   Max Drawdown  : -${total_max_dd:.0f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <i>Asumsi risk $100/trade (1%). Hasil aktual bisa berbeda.</i>"
-    )
+def daily_msg(date_str, stats):
+    wib=(datetime.now(tz=timezone.utc)+timedelta(hours=7)).strftime("%Y-%m-%d")
+    msg=(f"📊 <b>DAILY REPORT — {wib} (07:00 WIB)</b>\n"
+         f"🏦 Saldo: ${ACCOUNT_BALANCE} | Risk: ${RISK_PER_TRADE_USD}/trade\n"
+         f"━━━━━━━━━━━━━━━━━━━━━━\n")
+    tw=tl=0; tp=td=0.0
+    for (strat,pair),s in sorted(stats.items()):
+        tot=s["win"]+s["loss"]; wr=(s["win"]/tot*100) if tot>0 else 0
+        tw+=s["win"]; tl+=s["loss"]; tp+=s["pnl_usd"]; td=max(td,s["max_dd"])
+        sign="+" if s["pnl_usd"]>=0 else ""
+        li="🔴"*min(s["max_ls"],5); wi="🟢"*min(s["max_ws"],5)
+        msg+=(f"\n📌 <b>{strat.split('-')[0]} | {pair}</b>\n"
+              f"   {tot} trade ✅{s['win']} ❌{s['loss']} WR:{wr:.1f}%\n"
+              f"   P&L:{sign}${s['pnl_usd']:.2f} | DD:-${s['max_dd']:.0f}\n"
+              f"   {wi}max{s['max_ws']}w {li}max{s['max_ls']}l\n")
+    tt=tw+tl; twr=(tw/tt*100) if tt>0 else 0; sign="+" if tp>=0 else ""
+    msg+=(f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+          f"📊 TOTAL {tt} trade ✅{tw} ❌{tl} WR:{twr:.1f}%\n"
+          f"💵 P&L: <b>{sign}${tp:.2f}</b> | MaxDD:-${td:.0f}\n"
+          f"🏦 Saldo est: ~${ACCOUNT_BALANCE+tp:.0f}")
     return msg
 
 # ============================================================
-# 🔄  OPEN TRADE MONITOR
-# Cek apakah trade aktif sudah kena TP atau SL
+# OPEN TRADE MONITOR
 # ============================================================
-_open_trades: list[dict] = []  # {id, symbol, type, entry, sl, tp, risk_usd}
+_open_trades = []
 
-def monitor_open_trades():
-    """Cek setiap trade yang masih OPEN apakah sudah kena TP atau SL."""
-    global _open_trades
-    still_open = []
-
-    for trade in _open_trades:
-        price = get_current_price(trade["symbol"])
-        if price is None:
-            still_open.append(trade)
-            continue
-
-        hit_tp = hit_sl = False
-        if trade["type"] == "LONG":
-            if price >= trade["tp"]:
-                hit_tp = True
-            elif price <= trade["sl"]:
-                hit_sl = True
-        else:
-            if price <= trade["tp"]:
-                hit_tp = True
-            elif price >= trade["sl"]:
-                hit_sl = True
-
+def monitor():
+    global _open_trades; still=[]
+    for t in _open_trades:
+        price=get_price(t["asset"])
+        if price is None: still.append(t); continue
+        hit_tp = price>=t["tp"] if t["sig"]=="BUY" else price<=t["tp"]
+        hit_sl = price<=t["sl"] if t["sig"]=="BUY" else price>=t["sl"]
         if hit_tp or hit_sl:
-            result = "TP" if hit_tp else "SL"
-            update_signal_result(trade["id"], result, price, trade["risk_usd"])
-
-            icon    = "🎯" if hit_tp else "🛑"
-            pnl_pct = RR_RATIO if hit_tp else -1.0
-            pnl_usd = trade["risk_usd"] * RR_RATIO if hit_tp else -trade["risk_usd"]
-            pnl_sign = "+" if pnl_pct > 0 else ""
-
-            send_telegram(
-                f"{icon} <b>TRADE CLOSED — {result}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 Aset    : {trade['asset']}\n"
-                f"📌 Tipe    : {'🔼 LONG' if trade['type']=='LONG' else '🔽 SHORT'}\n"
-                f"💰 Entry   : ${trade['entry']:.4f}\n"
-                f"💰 Close   : ${price:.4f}\n"
-                f"📐 Hasil   : <b>{result}</b>\n"
-                f"💵 PnL     : {pnl_sign}{pnl_pct:.1f}% ({pnl_sign}${pnl_usd:.2f})\n"
-                f"📌 Strategi: {trade['strategy']}"
-            )
-            log.info(f"  {'✅' if hit_tp else '❌'} {trade['asset']} {result} | PnL: {pnl_sign}{pnl_pct:.1f}%")
-
-            # ── Cek losestreak real-time ───────────────────────────────────────
-            streaks = get_alltime_streak()
-            key = (trade["strategy"], trade["asset"])
-            if key in streaks:
-                sk = streaks[key]
-                cur_lose = sk["cur_lose"]
-                cur_dd   = sk["cur_dd_usd"]
-
-                # Alert losestreak ≥ 3
-                if cur_lose >= 3:
-                    lose_icons = "🔴" * min(cur_lose, 7)
-                    send_telegram(
-                        f"⚠️ <b>LOSESTREAK ALERT!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 Aset    : {trade['asset']}\n"
-                        f"🎯 Strategi: {trade['strategy'].split(' - ')[1]}\n"
-                        f"🔴 Losestreak: {lose_icons} <b>{cur_lose}x berturut!</b>\n"
-                        f"💸 Drawdown : -${cur_dd:.0f} (-{cur_lose:.0f}%)\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🛑 <i>Pertimbangkan untuk pause trading sementara\n"
-                        f"dan evaluasi kondisi market.</i>"
-                    )
-
-                # Alert winstreak ≥ 3
-                if sk["cur_win"] >= 3:
-                    win_icons = "🟢" * min(sk["cur_win"], 7)
-                    send_telegram(
-                        f"🔥 <b>WINSTREAK!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 Aset    : {trade['asset']}\n"
-                        f"🎯 Strategi: {trade['strategy'].split(' - ')[1]}\n"
-                        f"🟢 Winstreak: {win_icons} <b>{sk['cur_win']}x berturut!</b>\n"
-                        f"🚀 <i>Strategi sedang on fire!</i>"
-                    )
-
-        else:
-            still_open.append(trade)
-
-    _open_trades = still_open
+            res="TP" if hit_tp else "SL"
+            update_result(t["id"],res)
+            send_tg(result_msg(t,res,price))
+            log.info(f"  {'✅' if hit_tp else '❌'} {t['pair']} {res}")
+            sk=get_alltime_streak(); k=(t["strategy"],t["pair"])
+            if k in sk:
+                s=sk[k]
+                if s["cl"]>=3:
+                    icons="🔴"*min(s["cl"],7)
+                    send_tg(f"⚠️ <b>LOSESTREAK!</b>\n"
+                            f"💱 {t['pair']} | {t['strategy']}\n"
+                            f"{icons} <b>{s['cl']}x berturut!</b>\n"
+                            f"💸 Drawdown: -${s['cd']:.0f}\n"
+                            f"🛑 Pertimbangkan pause & evaluasi.")
+                if s["cw"]>=3:
+                    icons="🟢"*min(s["cw"],7)
+                    send_tg(f"🔥 <b>WINSTREAK!</b> {t['pair']} {s['cw']}x! {icons}")
+        else: still.append(t)
+    _open_trades=still
 
 # ============================================================
-# 🚀  MAIN SCAN LOOP
+# SIGNAL COOLDOWN
 # ============================================================
-_last_signals: dict = {}   # {(symbol, strategy): last_signal_ts} untuk deduplicate
-_last_report_date: str = ""
+_last_sig={}
+def can_send(pair,code):
+    k=(pair,code); now=time.time()
+    if now-_last_sig.get(k,0)<SIGNAL_COOLDOWN_H*3600: return False
+    _last_sig[k]=now; return True
 
-def should_send_signal(symbol: str, strategy: str) -> bool:
-    """Hindari mengirim sinyal yang sama dalam 1 jam."""
-    key    = (symbol, strategy)
-    now_ts = time.time()
-    last   = _last_signals.get(key, 0)
-    if now_ts - last < 3600:  # cooldown 1 jam
-        return False
-    _last_signals[key] = now_ts
-    return True
-
-def run_scan():
-    """Scan semua aset dengan kedua strategi."""
-    log.info("🔍 Mulai scan...")
-
+# ============================================================
+# MAIN SCAN
+# ============================================================
+def scan():
+    log.info("Scan 5 pairs x 3 strategies...")
     for asset in ASSETS:
-        symbol    = asset["symbol"]
-        name      = asset["name"]
-        risk_usd  = asset["risk_usd"]
+        name=asset["name"]; log.info(f"  {name}")
+        df30=fetch_ohlcv(asset,TF_HIGH,TF_H_BN,80)
+        df5 =fetch_ohlcv(asset,TF_MID, TF_M_BN,60)
+        df1 =fetch_ohlcv(asset,TF_LOW, TF_L_BN,20)
+        if df30 is None: log.warning(f"  No data {name}"); continue
 
-        log.info(f"  📊 Scan {name} ({symbol})")
+        def send_sig(sig, code):
+            if sig and can_send(name, code):
+                sid=save_signal(sig["pair"],sig["strategy"],sig["sig"],
+                    sig["entry"],sig["sl"],sig["tp"],sig["tf_confirm"],
+                    lot=sig.get("lot",0),pips_r=sig.get("pr",0),
+                    zh=sig.get("zh"),zl=sig.get("zl"),notes=sig.get("notes",""))
+                send_tg(sig_msg(sig))
+                _open_trades.append({"id":sid,"pair":sig["pair"],"strategy":sig["strategy"],
+                    "sig":sig["sig"],"entry":sig["entry"],"sl":sig["sl"],"tp":sig["tp"],
+                    "asset":asset})
+                log.info(f"  [{code}] {name} {sig['sig']} sent ID:{sid}")
 
-        # Fetch data semua TF
-        df_30m = fetch_ohlcv(symbol, TF_HIGH,  limit=60)
-        df_5m  = fetch_ohlcv(symbol, TF_MID,   limit=60)
-        df_1m  = fetch_ohlcv(symbol, TF_LOW,   limit=20)
+        send_sig(s1_entry(name, s1_zones(df30,name), df5, df1), "S1")
+        send_sig(s2_entry(name, s2_zones(df30,name), df5, df1), "S2")
+        send_sig(s3_entry(name, s3_zones(df30,name), df5, df1), "S3")
 
-        if df_30m is None:
-            log.warning(f"  ⚠️ Data {name} {TF_HIGH} tidak tersedia.")
-            continue
-
-        # ── Strategi 1: S/D Classic ───────────────────────────────────────────
-        zones = detect_sd_zones(df_30m)
-        log.debug(f"  Strategi 1: {len(zones)} zona valid ditemukan")
-
-        sig1 = check_strategy1_entry(symbol, name, zones, df_5m, df_1m)
-        if sig1 and should_send_signal(symbol, "S1"):
-            sig_id = save_signal(
-                name, sig1["strategy"], sig1["type"],
-                sig1["entry"], sig1["sl"], sig1["tp"],
-                sig1["tf_confirm"],
-                notes=f"Zone: {sig1['zone']['type']} {sig1['zone']['zone_low']:.4f}-{sig1['zone']['zone_high']:.4f}"
-            )
-            send_telegram(build_signal_message(sig1))
-            _open_trades.append({
-                "id":       sig_id,
-                "symbol":   symbol,
-                "asset":    name,
-                "strategy": sig1["strategy"],
-                "type":     sig1["type"],
-                "entry":    sig1["entry"],
-                "sl":       sig1["sl"],
-                "tp":       sig1["tp"],
-                "risk_usd": risk_usd,
-            })
-            log.info(f"  📨 Sinyal S1 {name} {sig1['type']} dikirim (ID: {sig_id})")
-
-        # ── Strategi 2: Fractal Scalping ──────────────────────────────────────
-        obs  = detect_order_blocks(df_30m)
-        log.debug(f"  Strategi 2: {len(obs)} OB valid ditemukan")
-
-        sig2 = check_strategy2_entry(symbol, name, obs, df_5m, df_1m)
-        if sig2 and should_send_signal(symbol, "S2"):
-            sig_id = save_signal(
-                name, sig2["strategy"], sig2["type"],
-                sig2["entry"], sig2["sl"], sig2["tp"],
-                sig2["tf_confirm"],
-                notes=f"OB: {sig2['ob']['type']} Q:{sig2['ob']['quality']}"
-            )
-            send_telegram(build_signal_message(sig2))
-            _open_trades.append({
-                "id":       sig_id,
-                "symbol":   symbol,
-                "asset":    name,
-                "strategy": sig2["strategy"],
-                "type":     sig2["type"],
-                "entry":    sig2["entry"],
-                "sl":       sig2["sl"],
-                "tp":       sig2["tp"],
-                "risk_usd": risk_usd,
-            })
-            log.info(f"  📨 Sinyal S2 {name} {sig2['type']} dikirim (ID: {sig_id})")
-
-    # Monitor open trades
-    monitor_open_trades()
-
-def check_daily_report():
-    """Kirim daily report jam 07:00 WIB (00:00 UTC)."""
-    global _last_report_date
-    now_utc   = datetime.now(tz=timezone.utc)
-    yesterday = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    if now_utc.hour == DAILY_REPORT_HOUR and now_utc.minute < 6:
-        if _last_report_date != yesterday:
-            stats = get_daily_stats(yesterday)
-            if stats:
-                send_telegram(build_daily_report(yesterday, stats))
-                log.info(f"📊 Daily report {yesterday} dikirim.")
-            else:
-                send_telegram(
-                    f"📊 <b>DAILY REPORT — {yesterday}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Tidak ada trade yang closed kemarin."
-                )
-            _last_report_date = yesterday
+    monitor()
 
 # ============================================================
-# ▶️  ENTRY POINT
+# DAILY REPORT
 # ============================================================
-def run_bot():
-    log.info("🚀 Trading Signal Bot AKTIF")
-    log.info(f"   Aset      : {', '.join(a['name'] for a in ASSETS)}")
-    log.info(f"   Strategi  : S/D Classic + Fractal Scalping")
-    log.info(f"   TF        : {TF_HIGH} / {TF_MID} / {TF_LOW}")
-    log.info(f"   Scan      : setiap {SCAN_INTERVAL_SEC//60} menit")
-    log.info(f"   RR        : 1:{RR_RATIO}")
+_last_rpt=""
+def check_report():
+    global _last_rpt
+    now=datetime.now(tz=timezone.utc); yd=(now-timedelta(days=1)).strftime("%Y-%m-%d")
+    if now.hour==DAILY_REPORT_HOUR and now.minute<6 and _last_rpt!=yd:
+        stats=get_daily_stats(yd)
+        msg=daily_msg(yd,stats) if stats else f"📊 Daily Report {yd}: tidak ada trade."
+        send_tg(msg); log.info(f"Daily report {yd} sent."); _last_rpt=yd
 
-    # Init database
+# ============================================================
+# ENTRY POINT
+# ============================================================
+def run():
+    log.info("Forex Signal Bot START")
+    log.info(f"Pairs: {', '.join(a['name'] for a in ASSETS)}")
+    log.info(f"Risk: ${RISK_PER_TRADE_USD}/trade | RR 1:{RR_RATIO} | Spread {SPREAD_PIPS}pips")
     init_db()
-
-    # Kirim pesan startup
-    send_telegram(
-        "🤖 <b>Trading Signal Bot AKTIF</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Aset: BTC/USDT + XAUT/USDT (Gold)\n"
-        f"🎯 Strategi 1: Supply & Demand Classic\n"
-        f"🎯 Strategi 2: Fractal Scalping\n"
-        f"⏱️ TF: {TF_HIGH} → {TF_MID} → {TF_LOW}\n"
-        f"📐 RR: 1:{RR_RATIO}\n"
-        f"🔄 Scan setiap {SCAN_INTERVAL_SEC//60} menit\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ <i>Bukan rekomendasi investasi.</i>"
-    )
-
-    # Scan pertama langsung
-    try:
-        run_scan()
-    except Exception as e:
-        log.error(f"💥 Scan pertama error: {e}", exc_info=True)
-
-    # Loop utama
+    send_tg("🤖 <b>Forex Signal Bot AKTIF</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💱 EURUSD | GBPUSD | USDJPY | XAUUSD | BTCUSD\n"
+            "🎯 S1: Imbalance+Fractal+EMA21/50\n"
+            "🎯 S2: S&D RBR/DBR/DBD/RBD\n"
+            "🎯 S3: Momentum Pullback+OB+PA\n"
+            f"📐 RR: 1:{RR_RATIO} | Spread: {SPREAD_PIPS}pips fixed\n"
+            f"💸 Risk: ${RISK_PER_TRADE_USD}/trade | Saldo: ${ACCOUNT_BALANCE}\n"
+            "📦 Signal = LIMIT ORDER, bukan market order.\n"
+            "⚠️ Bukan rekomendasi finansial.")
+    try: scan()
+    except Exception as e: log.error(f"First scan error: {e}", exc_info=True)
     while True:
         try:
             time.sleep(SCAN_INTERVAL_SEC)
-            check_daily_report()
-            run_scan()
-        except KeyboardInterrupt:
-            log.info("🛑 Bot dihentikan. Sampai jumpa! 👋")
-            break
-        except Exception as e:
-            log.error(f"💥 Error di loop utama: {e}", exc_info=True)
-            time.sleep(30)
+            check_report(); scan()
+        except KeyboardInterrupt: log.info("Bot stopped."); break
+        except Exception as e: log.error(f"Error: {e}", exc_info=True); time.sleep(30)
 
-if __name__ == "__main__":
-    run_bot()
+if __name__=="__main__": run()
