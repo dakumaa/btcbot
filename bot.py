@@ -1,23 +1,23 @@
+#!/usr/bin/env python3
 # ============================================================
-# POLYMARKET SIGNAL BOT v10
-# Coins     : BTC, ETH, BNB
-# Timeframe : 15M dan 1H (bersamaan, notif terpisah)
-# Strategi  : EXHAUSTION dengan adaptive streak:
-#             - ADX < 23 (sideways) → streak 3 candle (+ lanjut 4 jika salah)
-#             - ADX ≥ 23 (momentum) → streak 5 candle + konfirmasi candle ke-6
-# Odds      : Semua sinyal masuk, tandai jika odds ≤ 45¢
-# Report    : Akumulasi Day1-Day7 → Weekly → Reset
-#             Kolom: semua sinyal vs sinyal ber-odds
+# TRADING SIGNAL BOT — Supply & Demand + Fractal Scalping
+# Aset    : BTC/USDT + XAUUSDT (Gold proxy)
+# TF      : 30M (zona) → 5M (konfirmasi) → 1M (entry trigger)
+# Strategi 1: Supply & Demand Classic (Ruang Trader style)
+# Strategi 2: Fractal Scalping Set & Forget (Forex Sarjana style)
+# Tracking: SQLite database + Daily Report 07:00 WIB
 # ============================================================
 
-import json
 import logging
 import os
+import sqlite3
 import time
-from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from threading import Thread
 
+import ccxt
 import pandas as pd
+import pandas_ta as ta
 import requests
 from dotenv import load_dotenv
 
@@ -28,59 +28,38 @@ load_dotenv()
 # ============================================================
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "your_token_here")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "your_chat_id_here")
+BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY",    "")   # read-only, opsional
+BINANCE_API_SECRET  = os.getenv("BINANCE_API_SECRET", "")
 
-# ── Market condition thresholds ───────────────────────────────────────────────
-ADX_SIDEWAYS        = float(os.getenv("ADX_SIDEWAYS",    "23"))  # ADX < 23 = sideways
-ADX_PERIOD          = 14
-ATR_PERIOD          = 14
-
-# ── Streak levels ─────────────────────────────────────────────────────────────
-# Sideways: sinyal di streak 3, lanjut ke 4 jika salah
-SIDEWAYS_STREAK_1   = 3
-SIDEWAYS_STREAK_2   = 4
-
-# Momentum: sinyal saat 5 candle sama + candle ke-6 sama warna (konfirmasi)
-MOMENTUM_STREAK     = 6   # 5 sama + 1 konfirmasi
-
-# ── Odds notification threshold ───────────────────────────────────────────────
-ODDS_THRESHOLD      = float(os.getenv("ODDS_THRESHOLD", "0.45"))  # ≤ 45¢ = value
+# ── Aset ──────────────────────────────────────────────────────────────────────
+ASSETS = [
+    {"symbol": "BTC/USDT",  "name": "BTC",  "risk_usd": 100.0},
+    {"symbol": "XAUT/USDT", "name": "XAU",  "risk_usd": 100.0},
+]
 
 # ── Timeframes ────────────────────────────────────────────────────────────────
-TIMEFRAMES = {
-    "15m": {"interval_sec": 900,  "label": "15M", "candles_needed": 30},
-    "1h":  {"interval_sec": 3600, "label": "1H",  "candles_needed": 30},
-}
+TF_HIGH  = "30m"   # deteksi zona Supply & Demand
+TF_MID   = "5m"    # konfirmasi zona + rejection
+TF_LOW   = "1m"    # entry trigger
 
-# ── ET timezone ───────────────────────────────────────────────────────────────
-ET_OFFSET_HOURS     = -4
-ET_OFFSET           = timedelta(hours=ET_OFFSET_HOURS)
+# ── Strategi parameter ────────────────────────────────────────────────────────
+ATR_PERIOD          = 14
+STRONG_LEG_MULT     = 1.5   # candle leg out harus ≥ 1.5× ATR
+ZONE_FRESH_BUFFER   = 0.001 # 0.1% toleransi zona fresh
+RR_RATIO            = 3.0   # Risk:Reward 1:3
+SCAN_INTERVAL_SEC   = 300   # scan setiap 5 menit
 
-# ── API ───────────────────────────────────────────────────────────────────────
-BINANCE_KLINES_URL  = "https://data-api.binance.vision/api/v3/klines"
-BINANCE_TICKER_URL  = "https://data-api.binance.vision/api/v3/ticker/price"
-POLYMARKET_GAMMA    = "https://gamma-api.polymarket.com/markets"
+# ── Report ────────────────────────────────────────────────────────────────────
+DAILY_REPORT_HOUR   = 0     # 00:00 UTC = 07:00 WIB
+DB_PATH             = "signals.db"
 LOG_FILE            = "bot.log"
-
 MAX_RETRIES         = 3
-RETRY_DELAY         = 5
-STREAK_ALERT_N      = 3   # alert jika win/lose streak ≥ 3
-WEEKLY_DAYS         = 7
-DAILY_REPORT_HOUR   = 0   # 00:00 UTC = 07:00 WIB
-
-# ============================================================
-# 🪙  COINS
-# ============================================================
-COINS = [
-    {"symbol": "BTCUSDT", "name": "BTC"},
-    {"symbol": "ETHUSDT", "name": "ETH"},
-    {"symbol": "BNBUSDT", "name": "BNB"},
-]
 
 # ============================================================
 # 📋  LOGGING
 # ============================================================
-def setup_logger():
-    logger = logging.getLogger("PolyBot")
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("TradeBot")
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter(
         "[%(asctime)s UTC] %(levelname)s | %(message)s",
@@ -99,331 +78,668 @@ def setup_logger():
 log = setup_logger()
 
 # ============================================================
-# 📡  FETCH DATA
+# 🗄️  DATABASE
 # ============================================================
-def fetch_candles(symbol: str, interval: str, limit: int = 50) -> list:
-    """Fetch closed OHLCV candles dari Binance."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.get(
-                BINANCE_KLINES_URL,
-                params={"symbol": symbol, "interval": interval, "limit": limit + 1},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            raw = resp.json()
-            if not isinstance(raw, list):
-                return []
-            candles = [
-                [int(r[0]), float(r[1]), float(r[2]),
-                 float(r[3]), float(r[4]), float(r[5])]
-                for r in raw
-            ]
-            return candles[:-1]
-        except requests.exceptions.RequestException as e:
-            log.warning(f"  ⚠️ Fetch {symbol} {interval} gagal (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
-    return []
+def init_db():
+    """Buat tabel SQLite jika belum ada."""
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT    NOT NULL,
+            asset       TEXT    NOT NULL,
+            strategy    TEXT    NOT NULL,
+            signal_type TEXT    NOT NULL,
+            entry       REAL    NOT NULL,
+            sl          REAL    NOT NULL,
+            tp          REAL    NOT NULL,
+            rr          REAL    NOT NULL,
+            tf_confirm  TEXT    NOT NULL,
+            status      TEXT    DEFAULT 'OPEN',
+            result      TEXT,
+            pnl_pct     REAL,
+            pnl_usd     REAL,
+            close_time  TEXT,
+            notes       TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+    log.info("✅ Database siap.")
 
-def fetch_current_price(symbol: str) -> float | None:
+def save_signal(asset, strategy, signal_type, entry, sl, tp, tf_confirm, notes="") -> int:
+    """Simpan sinyal baru ke database, return ID."""
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("""
+        INSERT INTO signals
+        (timestamp, asset, strategy, signal_type, entry, sl, tp, rr, tf_confirm, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        asset, strategy, signal_type, entry, sl, tp, RR_RATIO, tf_confirm, notes
+    ))
+    sig_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return sig_id
+
+def update_signal_result(sig_id: int, result: str, close_price: float, risk_usd: float):
+    """Update hasil trade (TP/SL) di database."""
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("SELECT entry, sl, tp, signal_type FROM signals WHERE id=?", (sig_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+
+    entry, sl, tp, stype = row
+    if result == "TP":
+        pnl_pct = RR_RATIO * 1.0  # +3%
+        pnl_usd = risk_usd * RR_RATIO
+    else:
+        pnl_pct = -1.0             # -1%
+        pnl_usd = -risk_usd
+
+    cur.execute("""
+        UPDATE signals
+        SET status='CLOSED', result=?, pnl_pct=?, pnl_usd=?, close_time=?
+        WHERE id=?
+    """, (
+        result, pnl_pct, pnl_usd,
+        datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        sig_id
+    ))
+    conn.commit()
+    conn.close()
+
+def get_daily_stats(date_str: str) -> dict:
+    """Ambil statistik harian dari database, termasuk streak & drawdown."""
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT strategy, asset, result, pnl_pct, pnl_usd, close_time
+        FROM signals
+        WHERE DATE(timestamp) = ? AND status = 'CLOSED'
+        ORDER BY close_time ASC
+    """, (date_str,))
+    rows = cur.fetchall()
+    conn.close()
+
+    stats = {}
+    for strategy, asset, result, pnl_pct, pnl_usd, close_time in rows:
+        key = (strategy, asset)
+        if key not in stats:
+            stats[key] = {
+                "win": 0, "loss": 0,
+                "pnl_pct": 0.0, "pnl_usd": 0.0,
+                "results": [],          # urutan hasil untuk hitung streak
+                "max_losestreak": 0,    # losestreak terpanjang
+                "max_winstreak": 0,     # winstreak terpanjang
+                "max_drawdown_pct": 0.0, # drawdown maksimum (%)
+                "max_drawdown_usd": 0.0,
+            }
+        s = stats[key]
+        if result == "TP":
+            s["win"] += 1
+        else:
+            s["loss"] += 1
+        s["pnl_pct"] += pnl_pct or 0.0
+        s["pnl_usd"] += pnl_usd or 0.0
+        s["results"].append(result)
+
+    # Hitung streak dan drawdown dari urutan hasil
+    for key, s in stats.items():
+        results = s["results"]
+        cur_lose = cur_win = 0
+        max_lose = max_win = 0
+        cur_dd_pct = cur_dd_usd = 0.0
+        max_dd_pct = max_dd_usd = 0.0
+
+        for r in results:
+            if r == "SL":
+                cur_lose += 1
+                cur_win   = 0
+                cur_dd_pct += 1.0   # -1% per SL
+                cur_dd_usd += 100.0 # asumsi risk $100
+                max_dd_pct = max(max_dd_pct, cur_dd_pct)
+                max_dd_usd = max(max_dd_usd, cur_dd_usd)
+            else:
+                cur_win  += 1
+                cur_lose  = 0
+                cur_dd_pct = 0.0  # reset drawdown saat TP
+                cur_dd_usd = 0.0
+
+            max_lose = max(max_lose, cur_lose)
+            max_win  = max(max_win, cur_win)
+
+        s["max_losestreak"]   = max_lose
+        s["max_winstreak"]    = max_win
+        s["max_drawdown_pct"] = max_dd_pct
+        s["max_drawdown_usd"] = max_dd_usd
+
+    return stats
+
+def get_alltime_streak() -> dict:
+    """
+    Hitung losestreak dan drawdown sepanjang waktu dari semua closed trades.
+    Dipakai untuk alert real-time saat losestreak terjadi.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT strategy, asset, result, pnl_usd
+        FROM signals
+        WHERE status = 'CLOSED'
+        ORDER BY close_time ASC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    streaks = {}
+    for strategy, asset, result, pnl_usd in rows:
+        key = (strategy, asset)
+        if key not in streaks:
+            streaks[key] = {
+                "cur_lose": 0, "cur_win": 0,
+                "max_lose": 0, "max_win": 0,
+                "cur_dd_usd": 0.0, "max_dd_usd": 0.0,
+            }
+        s = streaks[key]
+        if result == "SL":
+            s["cur_lose"]   += 1
+            s["cur_win"]     = 0
+            s["cur_dd_usd"] += abs(pnl_usd or 100.0)
+            s["max_dd_usd"]  = max(s["max_dd_usd"], s["cur_dd_usd"])
+        else:
+            s["cur_win"]    += 1
+            s["cur_lose"]    = 0
+            s["cur_dd_usd"]  = 0.0
+        s["max_lose"] = max(s["max_lose"], s["cur_lose"])
+        s["max_win"]  = max(s["max_win"], s["cur_win"])
+
+    return streaks
+
+# ============================================================
+# 📡  BINANCE DATA FETCHER via CCXT
+# ============================================================
+_exchange = None
+
+def get_exchange() -> ccxt.binance:
+    global _exchange
+    if _exchange is None:
+        _exchange = ccxt.binance({
+            "apiKey":    BINANCE_API_KEY,
+            "secret":    BINANCE_API_SECRET,
+            "enableRateLimit": True,
+            "options":   {"defaultType": "spot"},
+        })
+    return _exchange
+
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame | None:
+    """
+    Fetch OHLCV dari Binance via CCXT.
+    Returns DataFrame dengan kolom: timestamp, open, high, low, close, volume
+    Candle terakhir (live) dibuang.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.get(BINANCE_TICKER_URL, params={"symbol": symbol}, timeout=10)
-            resp.raise_for_status()
-            return float(resp.json()["price"])
-        except Exception as e:
-            log.warning(f"  ⚠️ Fetch price {symbol} gagal (attempt {attempt}): {e}")
+            exc  = get_exchange()
+            data = exc.fetch_ohlcv(symbol, timeframe, limit=limit + 1)
+            if not data or len(data) < 3:
+                return None
+
+            df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.astype({"open": float, "high": float, "low": float,
+                            "close": float, "volume": float})
+            return df.iloc[:-1].reset_index(drop=True)  # buang candle live
+
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            log.warning(f"  ⚠️ Fetch {symbol} {timeframe} gagal (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
+                time.sleep(5)
+
+    log.error(f"❌ Fetch {symbol} {timeframe} gagal setelah {MAX_RETRIES} attempts.")
     return None
 
-# ============================================================
-# 📐  INDIKATOR — ADX dan ATR
-# ============================================================
-def calc_atr(candles: list, period: int = 14) -> tuple[float, float]:
-    """
-    Hitung ATR dan rata-rata ATR 5 periode.
-    Returns: (atr_current, atr_avg_5)
-    """
-    if len(candles) < period + 1:
-        return 0.0, 0.0
-
-    df = pd.DataFrame(candles, columns=["ts","open","high","low","close","vol"])
-    df["prev_close"] = df["close"].shift(1)
-    df["tr"] = df[["high","low","prev_close"]].apply(
-        lambda r: max(
-            r["high"] - r["low"],
-            abs(r["high"] - r["prev_close"]),
-            abs(r["low"]  - r["prev_close"])
-        ), axis=1
-    )
-    df["atr"] = df["tr"].ewm(span=period, adjust=False).mean()
-
-    atr_current = float(df["atr"].iloc[-1])
-    atr_avg5    = float(df["atr"].iloc[-6:-1].mean()) if len(df) >= 6 else atr_current
-
-    return atr_current, atr_avg5
-
-def calc_adx(candles: list, period: int = 14) -> float:
-    """
-    Hitung ADX(14).
-    ADX < 23  → sideways (gunakan streak 3)
-    ADX ≥ 23  → momentum (gunakan streak 5+1)
-    """
-    if len(candles) < period * 2 + 1:
-        return 20.0  # default: sideways jika data kurang
-
-    df = pd.DataFrame(candles, columns=["ts","open","high","low","close","vol"])
-
-    df["prev_high"]  = df["high"].shift(1)
-    df["prev_low"]   = df["low"].shift(1)
-    df["prev_close"] = df["close"].shift(1)
-
-    df["tr"] = df.apply(
-        lambda r: max(
-            r["high"] - r["low"],
-            abs(r["high"] - r["prev_close"]),
-            abs(r["low"]  - r["prev_close"])
-        ), axis=1
-    )
-
-    df["+dm"] = df.apply(
-        lambda r: max(r["high"] - r["prev_high"], 0)
-        if r["high"] - r["prev_high"] > r["prev_low"] - r["low"] else 0,
-        axis=1
-    )
-    df["-dm"] = df.apply(
-        lambda r: max(r["prev_low"] - r["low"], 0)
-        if r["prev_low"] - r["low"] > r["high"] - r["prev_high"] else 0,
-        axis=1
-    )
-
-    atr  = df["tr"].ewm(span=period, adjust=False).mean()
-    pdm  = df["+dm"].ewm(span=period, adjust=False).mean()
-    mdm  = df["-dm"].ewm(span=period, adjust=False).mean()
-
-    pdi  = 100 * pdm / atr.replace(0, 1e-10)
-    mdi  = 100 * mdm / atr.replace(0, 1e-10)
-    dx   = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, 1e-10)
-    adx  = dx.ewm(span=period, adjust=False).mean()
-
-    return float(adx.iloc[-1])
-
-def get_market_condition(candles: list) -> dict:
-    """
-    Tentukan kondisi market: SIDEWAYS atau MOMENTUM.
-    Returns: {condition, adx, atr, atr_avg5, streak_mode}
-    """
-    adx              = calc_adx(candles, ADX_PERIOD)
-    atr, atr_avg5    = calc_atr(candles, ATR_PERIOD)
-
-    # Sideways: ADX rendah DAN ATR tidak signifikan naik
-    atr_ratio        = atr / atr_avg5 if atr_avg5 > 0 else 1.0
-    is_sideways      = adx < ADX_SIDEWAYS
-
-    condition        = "SIDEWAYS" if is_sideways else "MOMENTUM"
-    streak_mode      = (
-        f"EXH-{SIDEWAYS_STREAK_1}/{SIDEWAYS_STREAK_2}"
-        if is_sideways
-        else f"EXH-{MOMENTUM_STREAK}"
-    )
-
-    return {
-        "condition":   condition,
-        "adx":         adx,
-        "atr":         atr,
-        "atr_avg5":    atr_avg5,
-        "atr_ratio":   atr_ratio,
-        "streak_mode": streak_mode,
-    }
-
-# ============================================================
-# 🔍  EXHAUSTION DETECTION
-# ============================================================
-def detect_exhaustion(candles: list, exh_state: dict, market: dict) -> dict | None:
-    """
-    Deteksi pola exhaustion berdasarkan kondisi market.
-
-    SIDEWAYS (ADX < 23):
-      Streak 3 candle sama warna → sinyal
-      Jika salah → lanjut ke streak 4 (state tersimpan)
-
-    MOMENTUM (ADX ≥ 23):
-      5 candle sama warna + candle ke-6 sama warna (konfirmasi) → sinyal
-      Tidak ada lanjutan setelah sinyal momentum
-    """
-    if len(candles) < 8:
+def get_current_price(symbol: str) -> float | None:
+    try:
+        exc    = get_exchange()
+        ticker = exc.fetch_ticker(symbol)
+        return float(ticker["last"])
+    except Exception as e:
+        log.warning(f"  ⚠️ Harga {symbol} gagal: {e}")
         return None
 
-    condition  = market["condition"]
-    recent     = candles[-8:]  # ambil 8 candle untuk hitung streak
+# ============================================================
+# 📐  INDIKATOR TEKNIKAL
+# ============================================================
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ATR menggunakan pandas_ta."""
+    atr = ta.atr(df["high"], df["low"], df["close"], length=period)
+    return atr
 
-    # Hitung streak termasuk candle sinyal (candles[-1])
-    bullish_streak = 0
-    for c in reversed(recent):
-        if c[4] >= c[1]:
-            bullish_streak += 1
+def detect_fractals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Deteksi Fractal High dan Fractal Low (Williams Fractal).
+    Fractal High: candle[i].high > candle[i-2, i-1, i+1, i+2].high
+    Fractal Low:  candle[i].low  < candle[i-2, i-1, i+1, i+2].low
+
+    Returns df dengan kolom fractal_high dan fractal_low.
+    """
+    df = df.copy()
+    df["fractal_high"] = False
+    df["fractal_low"]  = False
+
+    for i in range(2, len(df) - 2):
+        h = df["high"].iloc
+        l = df["low"].iloc
+
+        if (h[i] > h[i-1] and h[i] > h[i-2] and
+                h[i] > h[i+1] and h[i] > h[i+2]):
+            df.at[df.index[i], "fractal_high"] = True
+
+        if (l[i] < l[i-1] and l[i] < l[i-2] and
+                l[i] < l[i+1] and l[i] < l[i+2]):
+            df.at[df.index[i], "fractal_low"] = True
+
+    return df
+
+# ============================================================
+# 🏗️  STRATEGI 1: SUPPLY & DEMAND CLASSIC
+# ============================================================
+def detect_sd_zones(df_30m: pd.DataFrame) -> list[dict]:
+    """
+    Deteksi zona Supply & Demand di 30M.
+
+    Kriteria zona valid:
+    1. Fresh / Unmitigated — harga belum masuk kembali ke zona
+    2. Strong Leg Out — candle keluar zona ≥ 1.5× ATR
+    3. Struktur: Leg In → Base → Leg Out yang jelas
+
+    Returns: list of zone dict
+    {
+      type: "DEMAND" | "SUPPLY",
+      zone_high: float,
+      zone_low: float,
+      leg_out_size: float,
+      atr: float,
+      timestamp: str,
+    }
+    """
+    if df_30m is None or len(df_30m) < ATR_PERIOD + 5:
+        return []
+
+    atr_series = calc_atr(df_30m, ATR_PERIOD)
+    zones      = []
+
+    for i in range(3, len(df_30m) - 1):
+        atr_val = atr_series.iloc[i]
+        if pd.isna(atr_val) or atr_val <= 0:
+            continue
+
+        candle = df_30m.iloc[i]
+        prev1  = df_30m.iloc[i - 1]
+        prev2  = df_30m.iloc[i - 2]
+
+        # ── Cek struktur Leg In → Base → Leg Out ──────────────────────────────
+        # Leg In:  candle[i-2] bergerak kuat ke satu arah
+        # Base:    candle[i-1] kecil (konsolidasi / doji)
+        # Leg Out: candle[i] bergerak kuat ke arah berlawanan
+
+        body_prev2 = abs(prev2["close"] - prev2["open"])
+        body_prev1 = abs(prev1["close"] - prev1["open"])
+        body_curr  = abs(candle["close"] - candle["open"])
+
+        # Base harus kecil (body < 0.5× ATR)
+        if body_prev1 > 0.5 * atr_val:
+            continue
+
+        # Leg Out harus besar (≥ STRONG_LEG_MULT × ATR)
+        leg_out_size = candle["high"] - candle["low"]
+        if leg_out_size < STRONG_LEG_MULT * atr_val:
+            continue
+
+        ts_str = str(df_30m["timestamp"].iloc[i])
+
+        # ── DEMAND ZONE: Leg In turun → Base → Leg Out naik ──────────────────
+        if (prev2["close"] < prev2["open"] and   # leg in = bearish
+                candle["close"] > candle["open"] and  # leg out = bullish
+                candle["close"] > prev2["open"]):    # leg out lebih tinggi
+
+            zone_low  = min(prev1["low"],  candle["low"])
+            zone_high = max(prev1["high"], candle["open"])
+
+            # Cek fresh: harga setelah zona tidak masuk kembali ke zona
+            is_fresh = True
+            for j in range(i + 1, len(df_30m)):
+                if df_30m["low"].iloc[j] <= zone_high:
+                    is_fresh = False
+                    break
+
+            if is_fresh:
+                zones.append({
+                    "type":        "DEMAND",
+                    "zone_high":   zone_high,
+                    "zone_low":    zone_low,
+                    "leg_out_size": leg_out_size,
+                    "atr":         atr_val,
+                    "timestamp":   ts_str,
+                    "index":       i,
+                })
+
+        # ── SUPPLY ZONE: Leg In naik → Base → Leg Out turun ──────────────────
+        elif (prev2["close"] > prev2["open"] and  # leg in = bullish
+                candle["close"] < candle["open"] and  # leg out = bearish
+                candle["close"] < prev2["open"]):    # leg out lebih rendah
+
+            zone_high = max(prev1["high"], candle["high"])
+            zone_low  = min(prev1["low"],  candle["open"])
+
+            is_fresh = True
+            for j in range(i + 1, len(df_30m)):
+                if df_30m["high"].iloc[j] >= zone_low:
+                    is_fresh = False
+                    break
+
+            if is_fresh:
+                zones.append({
+                    "type":        "SUPPLY",
+                    "zone_high":   zone_high,
+                    "zone_low":    zone_low,
+                    "leg_out_size": leg_out_size,
+                    "atr":         atr_val,
+                    "timestamp":   ts_str,
+                    "index":       i,
+                })
+
+    return zones
+
+def check_strategy1_entry(
+    symbol: str, asset_name: str, zones: list[dict],
+    df_5m: pd.DataFrame, df_1m: pd.DataFrame
+) -> dict | None:
+    """
+    Konfirmasi entry Strategi 1 di 5M dan 1M.
+
+    1. Harga mendekati zona 30M (dalam zona ± 0.1% dari zone_high/low)
+    2. Di 5M: ada rejection candle (wick panjang) atau engulfing
+    3. Di 1M: candle penutup melewati high/low candle sebelumnya (trigger)
+    """
+    if df_5m is None or df_1m is None or not zones:
+        return None
+
+    price_5m = df_5m["close"].iloc[-1]
+
+    for zone in zones:
+        zh = zone["zone_high"]
+        zl = zone["zone_low"]
+
+        # Cek apakah harga mendekati zona
+        if zone["type"] == "DEMAND":
+            in_zone = zl * (1 - ZONE_FRESH_BUFFER) <= price_5m <= zh * (1 + ZONE_FRESH_BUFFER)
         else:
-            break
+            in_zone = zl * (1 - ZONE_FRESH_BUFFER) <= price_5m <= zh * (1 + ZONE_FRESH_BUFFER)
 
-    bearish_streak = 0
-    for c in reversed(recent):
-        if c[4] < c[1]:
-            bearish_streak += 1
+        if not in_zone:
+            continue
+
+        # Konfirmasi 5M: cari rejection candle
+        last_5m  = df_5m.iloc[-1]
+        body_5m  = abs(last_5m["close"] - last_5m["open"])
+        range_5m = last_5m["high"] - last_5m["low"]
+        wick_ratio = (range_5m - body_5m) / range_5m if range_5m > 0 else 0
+
+        confirmed_5m = False
+        if zone["type"] == "DEMAND" and wick_ratio >= 0.6 and last_5m["close"] > last_5m["open"]:
+            confirmed_5m = True
+        elif zone["type"] == "SUPPLY" and wick_ratio >= 0.6 and last_5m["close"] < last_5m["open"]:
+            confirmed_5m = True
+
+        if not confirmed_5m:
+            continue
+
+        # Trigger 1M: candle bullish melewati high sebelumnya (demand)
+        # atau candle bearish melewati low sebelumnya (supply)
+        last_1m = df_1m.iloc[-1]
+        prev_1m = df_1m.iloc[-2]
+        triggered = False
+
+        if zone["type"] == "DEMAND" and last_1m["close"] > prev_1m["high"]:
+            triggered = True
+        elif zone["type"] == "SUPPLY" and last_1m["close"] < prev_1m["low"]:
+            triggered = True
+
+        if not triggered:
+            continue
+
+        # Hitung entry, SL, TP
+        if zone["type"] == "DEMAND":
+            entry  = last_1m["close"]
+            sl     = zl * (1 - 0.0005)   # SL di bawah zona dengan buffer kecil
+            risk   = entry - sl
+            tp     = entry + risk * RR_RATIO
+            stype  = "LONG"
         else:
-            break
+            entry  = last_1m["close"]
+            sl     = zh * (1 + 0.0005)
+            risk   = sl - entry
+            tp     = entry - risk * RR_RATIO
+            stype  = "SHORT"
 
-    prev_color = exh_state.get("color", "")
-    prev_count = exh_state.get("count", 0)
-    sinyal_c   = candles[-1]
-
-    log.debug(
-        f"  Cond:{condition} 🟢={bullish_streak} 🔴={bearish_streak} "
-        f"ADX:{market['adx']:.1f} state={prev_color}/{prev_count}"
-    )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # MODE SIDEWAYS — streak 3, lanjut 4 jika salah
-    # ══════════════════════════════════════════════════════════════════════════
-    if condition == "SIDEWAYS":
-
-        # 3 candle hijau → sinyal DOWN
-        if bullish_streak == SIDEWAYS_STREAK_1:
-            return _make_sig("DOWN", "GREEN", SIDEWAYS_STREAK_1, sinyal_c, market,
-                             f"3🟢 (sideways) → potensi DOWN")
-
-        # 4 candle hijau → sinyal DOWN lanjutan (hanya jika EXH-3 sebelumnya salah)
-        if bullish_streak == SIDEWAYS_STREAK_2 and prev_color == "GREEN" and prev_count == SIDEWAYS_STREAK_1:
-            return _make_sig("DOWN", "GREEN", SIDEWAYS_STREAK_2, sinyal_c, market,
-                             f"4🟢 (sideways lanjutan) → potensi DOWN")
-
-        # 3 candle merah → sinyal UP
-        if bearish_streak == SIDEWAYS_STREAK_1:
-            return _make_sig("UP", "RED", SIDEWAYS_STREAK_1, sinyal_c, market,
-                             f"3🔴 (sideways) → potensi UP")
-
-        # 4 candle merah → sinyal UP lanjutan
-        if bearish_streak == SIDEWAYS_STREAK_2 and prev_color == "RED" and prev_count == SIDEWAYS_STREAK_1:
-            return _make_sig("UP", "RED", SIDEWAYS_STREAK_2, sinyal_c, market,
-                             f"4🔴 (sideways lanjutan) → potensi UP")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # MODE MOMENTUM — 5 candle sama + candle ke-6 konfirmasi (sama warna)
-    # Logika: streak ke-6 = 5 candle sebelumnya sudah sama + candle ini sama
-    # Artinya bullish_streak == 6 atau bearish_streak == 6
-    # ══════════════════════════════════════════════════════════════════════════
-    else:
-        if bullish_streak == MOMENTUM_STREAK:
-            return _make_sig("DOWN", "GREEN", MOMENTUM_STREAK, sinyal_c, market,
-                             f"5🟢+1🟢 konfirmasi (momentum) → potensi DOWN")
-
-        if bearish_streak == MOMENTUM_STREAK:
-            return _make_sig("UP", "RED", MOMENTUM_STREAK, sinyal_c, market,
-                             f"5🔴+1🔴 konfirmasi (momentum) → potensi UP")
+        return {
+            "strategy":   "STRATEGI 1 - S/D Classic",
+            "asset":      asset_name,
+            "symbol":     symbol,
+            "type":       stype,
+            "entry":      entry,
+            "sl":         sl,
+            "tp":         tp,
+            "zone":       zone,
+            "tf_confirm": f"{TF_HIGH} zone / {TF_MID} rejection / {TF_LOW} trigger",
+        }
 
     return None
 
-def _make_sig(signal, streak_color, streak_count, candle, market, extra) -> dict:
-    return {
-        "signal":       signal,
-        "streak_color": streak_color,
-        "streak_count": streak_count,
-        "candle":       candle,
-        "extra":        extra,
-        "condition":    market["condition"],
-        "adx":          market["adx"],
-        "atr_ratio":    market["atr_ratio"],
-    }
-
 # ============================================================
-# 🎰  POLYMARKET ODDS FETCHER
+# 🏗️  STRATEGI 2: FRACTAL SCALPING SET & FORGET
 # ============================================================
-def fetch_polymarket_odds(name: str, open_ts_ms: int, tf: str) -> dict | None:
+def detect_order_blocks(df_30m: pd.DataFrame) -> list[dict]:
     """
-    Ambil odds dari Polymarket Gamma API.
-    Slug format: {coin}-updown-{tf}-{next_window_ts}
+    Deteksi Order Block di 30M.
+    Order Block = candle terakhir yang berlawanan arah sebelum
+    pergerakan impulsif (strong move).
+
+    Dikombinasikan dengan Fractal untuk filter kualitas tinggi.
     """
-    interval_sec = TIMEFRAMES[tf]["interval_sec"]
-    open_ts_sec  = open_ts_ms // 1000
-    next_window  = ((open_ts_sec // interval_sec) + 1) * interval_sec
-    slug         = f"{name.lower()}-updown-{tf}-{next_window}"
+    if df_30m is None or len(df_30m) < ATR_PERIOD + 5:
+        return []
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.get(
-                POLYMARKET_GAMMA,
-                params={"slug": slug},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+    atr_series = calc_atr(df_30m, ATR_PERIOD)
+    df_frac    = detect_fractals(df_30m)
+    obs        = []
 
-            if not data or not isinstance(data, list):
-                log.debug(f"  ↳ Market tidak ditemukan: {slug}")
-                return None
+    for i in range(2, len(df_30m) - 1):
+        atr_val = atr_series.iloc[i]
+        if pd.isna(atr_val) or atr_val <= 0:
+            continue
 
-            market   = data[0]
-            outcomes = market.get("outcomes", "[]")
-            prices   = market.get("outcomePrices", "[]")
+        curr  = df_30m.iloc[i]
+        prev  = df_30m.iloc[i - 1]
+        next_ = df_30m.iloc[i + 1] if i + 1 < len(df_30m) else None
 
-            if isinstance(outcomes, str):
-                outcomes = json.loads(outcomes)
-                prices   = json.loads(prices)
+        if next_ is None:
+            continue
 
-            if len(outcomes) < 2 or len(prices) < 2:
-                return None
+        # Move impulsif setelah candle ini
+        next_move = next_["high"] - next_["low"]
 
-            up_idx, dn_idx = 0, 1
-            for i, o in enumerate(outcomes):
-                ol = str(o).lower()
-                if ol in ("up", "higher", "yes"):
-                    up_idx = i
-                elif ol in ("down", "lower", "no"):
-                    dn_idx = i
+        # ── Bullish Order Block ────────────────────────────────────────────────
+        # Candle[i] bearish → candle[i+1] bullish impulsif (≥ 1.5× ATR)
+        if (curr["close"] < curr["open"] and
+                next_["close"] > next_["open"] and
+                next_move >= STRONG_LEG_MULT * atr_val):
 
-            up_price = float(prices[up_idx])
-            dn_price = float(prices[dn_idx])
+            # Diperkuat jika ada Fractal Low di dekat area ini
+            near_fractal = df_frac["fractal_low"].iloc[max(0, i-3):i+1].any()
+
+            ob_high = curr["high"]
+            ob_low  = curr["low"]
+
+            # Fresh check
+            is_fresh = True
+            for j in range(i + 2, len(df_30m)):
+                if df_30m["low"].iloc[j] <= ob_low:
+                    is_fresh = False
+                    break
+
+            obs.append({
+                "type":      "BULLISH_OB",
+                "ob_high":   ob_high,
+                "ob_low":    ob_low,
+                "atr":       atr_val,
+                "fractal":   near_fractal,
+                "quality":   "HIGH" if near_fractal else "MEDIUM",
+                "fresh":     is_fresh,
+                "timestamp": str(df_30m["timestamp"].iloc[i]),
+                "index":     i,
+            })
+
+        # ── Bearish Order Block ────────────────────────────────────────────────
+        elif (curr["close"] > curr["open"] and
+                next_["close"] < next_["open"] and
+                next_move >= STRONG_LEG_MULT * atr_val):
+
+            near_fractal = df_frac["fractal_high"].iloc[max(0, i-3):i+1].any()
+
+            ob_high = curr["high"]
+            ob_low  = curr["low"]
+
+            is_fresh = True
+            for j in range(i + 2, len(df_30m)):
+                if df_30m["high"].iloc[j] >= ob_high:
+                    is_fresh = False
+                    break
+
+            obs.append({
+                "type":      "BEARISH_OB",
+                "ob_high":   ob_high,
+                "ob_low":    ob_low,
+                "atr":       atr_val,
+                "fractal":   near_fractal,
+                "quality":   "HIGH" if near_fractal else "MEDIUM",
+                "fresh":     is_fresh,
+                "timestamp": str(df_30m["timestamp"].iloc[i]),
+                "index":     i,
+            })
+
+    # Kembalikan hanya yang fresh
+    return [ob for ob in obs if ob["fresh"]]
+
+def check_strategy2_entry(
+    symbol: str, asset_name: str, obs: list[dict],
+    df_5m: pd.DataFrame, df_1m: pd.DataFrame
+) -> dict | None:
+    """
+    Konfirmasi entry Strategi 2 di 5M (Fractal) dan 1M (trigger).
+
+    Filter tambahan vs Strategi 1:
+    - Hanya ambil Order Block berkualitas HIGH (ada Fractal nearby)
+    - 5M: Fractal Low/High di dalam OB area
+    - 1M: Candle trigger dengan volume konfirmasi
+    """
+    if df_5m is None or df_1m is None or not obs:
+        return None
+
+    df_5m_frac = detect_fractals(df_5m)
+    price_5m   = df_5m["close"].iloc[-1]
+
+    for ob in obs:
+        # Prioritaskan OB berkualitas HIGH
+        if ob["quality"] != "HIGH":
+            continue
+
+        # Cek harga mendekati OB
+        buffer = ob["atr"] * 0.3
+        near_ob = ob["ob_low"] - buffer <= price_5m <= ob["ob_high"] + buffer
+
+        if not near_ob:
+            continue
+
+        # ── Konfirmasi 5M: ada Fractal Low di area OB Bullish ─────────────────
+        if ob["type"] == "BULLISH_OB":
+            # Cari fractal low di 5M yang berada dalam OB range
+            frac_in_ob = False
+            for i, row in df_5m.iterrows():
+                if df_5m_frac["fractal_low"].iloc[i] and ob["ob_low"] <= row["low"] <= ob["ob_high"]:
+                    frac_in_ob = True
+                    break
+
+            if not frac_in_ob:
+                continue
+
+            # Trigger 1M: candle bullish break previous high
+            last_1m = df_1m.iloc[-1]
+            prev_1m = df_1m.iloc[-2]
+            if not (last_1m["close"] > prev_1m["high"] and last_1m["close"] > last_1m["open"]):
+                continue
+
+            entry = last_1m["close"]
+            sl    = ob["ob_low"] * (1 - 0.0003)
+            risk  = entry - sl
+            tp    = entry + risk * RR_RATIO
 
             return {
-                "up":   up_price,
-                "down": dn_price,
-                "slug": slug,
-                "link": f"https://polymarket.com/event/{slug}",
+                "strategy":   "STRATEGI 2 - Fractal Scalping",
+                "asset":      asset_name,
+                "symbol":     symbol,
+                "type":       "LONG",
+                "entry":      entry,
+                "sl":         sl,
+                "tp":         tp,
+                "ob":         ob,
+                "tf_confirm": f"{TF_HIGH} OB / {TF_MID} Fractal / {TF_LOW} trigger",
+                "quality":    ob["quality"],
             }
 
-        except Exception as e:
-            log.warning(f"  ⚠️ Polymarket odds gagal (attempt {attempt}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
+        # ── Konfirmasi 5M: ada Fractal High di area OB Bearish ────────────────
+        elif ob["type"] == "BEARISH_OB":
+            frac_in_ob = False
+            for i, row in df_5m.iterrows():
+                if df_5m_frac["fractal_high"].iloc[i] and ob["ob_low"] <= row["high"] <= ob["ob_high"]:
+                    frac_in_ob = True
+                    break
+
+            if not frac_in_ob:
+                continue
+
+            last_1m = df_1m.iloc[-1]
+            prev_1m = df_1m.iloc[-2]
+            if not (last_1m["close"] < prev_1m["low"] and last_1m["close"] < last_1m["open"]):
+                continue
+
+            entry = last_1m["close"]
+            sl    = ob["ob_high"] * (1 + 0.0003)
+            risk  = sl - entry
+            tp    = entry - risk * RR_RATIO
+
+            return {
+                "strategy":   "STRATEGI 2 - Fractal Scalping",
+                "asset":      asset_name,
+                "symbol":     symbol,
+                "type":       "SHORT",
+                "entry":      entry,
+                "sl":         sl,
+                "tp":         tp,
+                "ob":         ob,
+                "tf_confirm": f"{TF_HIGH} OB / {TF_MID} Fractal / {TF_LOW} trigger",
+                "quality":    ob["quality"],
+            }
 
     return None
-
-# ============================================================
-# ⏱️  TIMING
-# ============================================================
-def get_poly_window_end_utc(open_ts_ms: int, tf: str) -> int:
-    interval_sec  = TIMEFRAMES[tf]["interval_sec"]
-    open_ts_sec   = open_ts_ms // 1000
-    open_dt_utc   = datetime.fromtimestamp(open_ts_sec, tz=timezone.utc)
-    open_dt_et    = open_dt_utc + ET_OFFSET
-    et_epoch      = int(open_dt_et.timestamp())
-    et_floored    = (et_epoch // interval_sec) * interval_sec
-    et_window_end = et_floored + interval_sec
-    return et_window_end - int(ET_OFFSET.total_seconds())
-
-def get_result_ready_ts(open_ts_ms: int, tf: str) -> int:
-    return get_poly_window_end_utc(open_ts_ms, tf) + 10
-
-def fmt_utc(ts_sec: int) -> str:
-    return datetime.fromtimestamp(ts_sec, tz=timezone.utc).strftime("%H:%M")
-
-def fmt_et(ts_sec: int) -> str:
-    return (datetime.fromtimestamp(ts_sec, tz=timezone.utc) + ET_OFFSET).strftime("%H:%M")
-
-def seconds_until_next_15m() -> float:
-    now = time.time()
-    return (900 - now % 900) + 3
 
 # ============================================================
 # 📨  TELEGRAM
@@ -436,8 +752,12 @@ def send_telegram(message: str) -> bool:
         try:
             resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": message,
-                      "parse_mode": "HTML", "disable_web_page_preview": True},
+                json={
+                    "chat_id":    TELEGRAM_CHAT_ID,
+                    "text":       message,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
                 timeout=10,
             )
             resp.raise_for_status()
@@ -445,486 +765,364 @@ def send_telegram(message: str) -> bool:
         except requests.exceptions.RequestException as e:
             log.warning(f"  ⚠️ Telegram gagal (attempt {attempt}): {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
+                time.sleep(3)
     return False
 
 # ============================================================
 # 🏗️  BUILD MESSAGES
 # ============================================================
-def build_signal_message(
-    sig: dict, name: str, tf: str, open_ts_ms: int,
-    odds: dict | None
-) -> str:
-    ts, o, h, l, c, _ = sig["candle"]
-    dt_str   = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-    tf_label = TIMEFRAMES[tf]["label"]
-    arrow    = "🐂 UP" if sig["signal"] == "UP" else "🐻 DOWN"
-    n        = sig["streak_count"]
-    we       = get_poly_window_end_utc(open_ts_ms, tf)
+def build_signal_message(sig: dict) -> str:
+    now_str   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # Konversi ke WIB (UTC+7)
+    wib_str   = (datetime.now(tz=timezone.utc) + timedelta(hours=7)).strftime("%H:%M WIB")
+    stype     = sig["type"]
+    arrow     = "🔼 LONG" if stype == "LONG" else "🔽 SHORT"
+    strategy  = sig["strategy"]
+    asset     = sig["asset"]
 
-    # Odds section
-    if odds:
-        our_odds = odds["up"] if sig["signal"] == "UP" else odds["down"]
-        is_value = our_odds <= ODDS_THRESHOLD
-        value_tag = "✅ VALUE BET!" if is_value else "⚠️ Odds tinggi"
-        odds_line = (
-            f"\n🎰 <b>Polymarket Odds:</b>\n"
-            f"   Beli {arrow}: <b>{our_odds*100:.0f}¢</b> {value_tag}\n"
-            f"   BEP jika beli: WR ≥ {our_odds*100:.0f}%\n"
-            f"   Profit jika menang: +{(1-our_odds)*100:.0f}¢\n"
-            f"🔗 Market: {odds['link']}"
+    entry = sig["entry"]
+    sl    = sig["sl"]
+    tp    = sig["tp"]
+    risk  = abs(entry - sl)
+    rr    = abs(tp - entry) / risk if risk > 0 else 0
+
+    # Zona info
+    zone_info = ""
+    if "zone" in sig:
+        z = sig["zone"]
+        zone_info = (
+            f"📦 Zona {z['type']}: ${z['zone_low']:.4f} - ${z['zone_high']:.4f}\n"
+            f"   Leg Out: {z['leg_out_size']:.4f} ({z['leg_out_size']/z['atr']:.1f}× ATR)\n"
         )
-        odds_flag = "🎰" if is_value else "📊"
-    else:
-        odds_line = "\n📊 <i>Odds Polymarket tidak tersedia saat ini</i>"
-        odds_flag = "📊"
+    elif "ob" in sig:
+        ob = sig["ob"]
+        quality_icon = "⭐⭐" if ob["quality"] == "HIGH" else "⭐"
+        zone_info = (
+            f"📦 Order Block: ${ob['ob_low']:.4f} - ${ob['ob_high']:.4f}\n"
+            f"   Kualitas: {quality_icon} {ob['quality']} "
+            f"{'(+Fractal)' if ob['fractal'] else ''}\n"
+        )
 
     return (
-        f"🚨 <b>[{tf_label}] {odds_flag} SIGNAL — {arrow}</b>\n"
+        f"🚨 <b>[{strategy}]</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ Candle  : {dt_str} (UTC)\n"
-        f"📊 Coin    : {name}\n"
-        f"📊 OHLC    : O:<code>{o:.4f}</code> H:<code>{h:.4f}</code> "
-        f"L:<code>{l:.4f}</code> C:<code>{c:.4f}</code>\n"
-        f"📋 Pola    : {sig['extra']}\n"
-        f"📈 Kondisi : {sig['condition']} | ADX:{sig['adx']:.1f} | ATR ratio:{sig['atr_ratio']:.2f}\n"
+        f"📊 Aset      : <b>{asset}</b>\n"
+        f"📌 Sinyal    : <b>{arrow}</b>\n"
+        f"⏰ Waktu     : {now_str} / {wib_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Ref Price: <b>${c:.6f}</b>\n"
-        f"   <i>(Close candle {tf_label} = acuan Polymarket)</i>"
-        f"{odds_line}\n"
+        f"💰 Entry     : <b>${entry:.4f}</b>\n"
+        f"🛑 Stop Loss : ${sl:.4f} ({abs(entry-sl)/entry*100:.2f}%)\n"
+        f"🎯 Take Profit: ${tp:.4f} ({abs(tp-entry)/entry*100:.2f}%)\n"
+        f"📐 Risk:Reward: 1:{rr:.1f}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 Window tutup: {fmt_et(we)} ET / {fmt_utc(we)} UTC\n"
-        f"⏳ <i>Result dikirim tepat saat window {tf_label} tutup</i>"
+        f"{zone_info}"
+        f"🔍 TF Confirm: {sig['tf_confirm']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ <i>Ini notifikasi sinyal, bukan rekomendasi finansial.\n"
+        f"Selalu gunakan risk management yang tepat.</i>"
     )
 
-def build_result_message(pending: dict, result_price: float, now_str: str) -> str:
-    ref_price  = pending["ref_price"]
-    signal     = pending["signal"]
-    tf_label   = TIMEFRAMES[pending["tf"]]["label"]
-    n          = pending["streak_count"]
-    price_diff = result_price - ref_price
-    pct_change = (price_diff / ref_price * 100) if ref_price > 0 else 0
-    diff_sign  = "+" if price_diff > 0 else ""
-    is_correct = (result_price > ref_price) if signal == "UP" else (result_price < ref_price)
-    direction  = "⬆️ Naik" if price_diff > 0 else "⬇️ Turun"
-    verdict    = "✅ <b>BENAR</b>" if is_correct else "❌ <b>SALAH</b>"
-    emoji      = "🎯" if is_correct else "💔"
-
-    now_et = (datetime.strptime(now_str, "%Y-%m-%d %H:%M")
-              .replace(tzinfo=timezone.utc) + ET_OFFSET).strftime("%Y-%m-%d %H:%M")
-
-    # Odds P/L jika tersedia
-    odds_pl = ""
-    if pending.get("our_odds") is not None:
-        our_odds = pending["our_odds"]
-        pl = (1 - our_odds) if is_correct else -our_odds
-        odds_pl = f"\n💰 P/L (jika bet $1): <b>{'+' if pl>=0 else ''}{pl*100:.0f}¢</b>"
-
-    return (
-        f"{emoji} <b>[{tf_label}] HASIL — {verdict}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Coin      : {pending['name']}\n"
-        f"📌 Sinyal    : <b>{'🐂 UP' if signal=='UP' else '🐻 DOWN'}</b> "
-        f"[EXH-{n} {pending['condition']}]\n"
-        f"⏰ Entry     : {pending['entry_time']} UTC\n"
-        f"💰 Ref Price : <b>${ref_price:.6f}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ Window End: {now_et} ET / {now_str} UTC\n"
-        f"💰 Close     : <b>${result_price:.6f}</b>\n"
-        f"📈 Pergerakan: {direction} "
-        f"<code>{diff_sign}{price_diff:.6f}</code> "
-        f"(<code>{diff_sign}{pct_change:.3f}%</code>)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏁 Verdict   : {verdict}{odds_pl}\n"
-        f"📌 <i>Dinilai vs ref price (close candle {tf_label})</i>"
-    )
-
-# ============================================================
-# 📈  STATS STRUCTURE
-# ============================================================
-def new_stat() -> dict:
-    """
-    Struktur statistik per kategori:
-    all_  = semua sinyal
-    odds_ = hanya sinyal yang odds ≤ 45¢
-    """
-    return {
-        "all_win": 0, "all_loss": 0,
-        "odds_win": 0, "odds_loss": 0,
-    }
-
-def stat_line(s: dict, label: str) -> str:
-    """Buat baris statistik dengan WR."""
-    at = s["all_win"] + s["all_loss"]
-    awr = (s["all_win"] / at * 100) if at > 0 else 0
-    ot = s["odds_win"] + s["odds_loss"]
-    owr = (s["odds_win"] / ot * 100) if ot > 0 else 0
-    return (
-        f"  {label}\n"
-        f"    Semua  : ✅{s['all_win']} ❌{s['all_loss']} "
-        f"({at} sinyal) WR:{awr:.1f}%\n"
-        f"    Ber-odds≤45¢: ✅{s['odds_win']} ❌{s['odds_loss']} "
-        f"({ot} sinyal) WR:{owr:.1f}%\n"
-    )
-
-# ============================================================
-# 📊  DAILY & WEEKLY REPORT
-# ============================================================
-def build_day_report(day_num: int, day_stats: dict) -> str:
-    """
-    day_stats format:
-    {
-      "15m": {"EXH3": new_stat(), "EXH4": new_stat(), "EXH6": new_stat()},
-      "1h":  {"EXH3": new_stat(), "EXH4": new_stat(), "EXH6": new_stat()},
-      "coin": {"BTC": new_stat(), "ETH": new_stat(), "BNB": new_stat()},
-    }
-    """
-    now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    msg     = f"📊 <b>DAY {day_num} REPORT — {now_str} (07:00 WIB)</b>\n"
+def build_daily_report(date_str: str, stats: dict) -> str:
+    wib_str = (datetime.now(tz=timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d")
+    msg     = f"📊 <b>DAILY REPORT — {wib_str} (07:00 WIB)</b>\n"
     msg    += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
-    for tf_key, tf_label in [("15m", "15M"), ("1h", "1H")]:
-        msg += f"\n⏱️ <b>Timeframe {tf_label}:</b>\n"
-        for exh_key, exh_label in [("EXH3","Sideways EXH-3"),
-                                    ("EXH4","Sideways EXH-4"),
-                                    ("EXH6","Momentum EXH-6")]:
-            s = day_stats.get(tf_key, {}).get(exh_key, new_stat())
-            if s["all_win"] + s["all_loss"] > 0:
-                msg += stat_line(s, exh_label)
+    total_win = total_loss = 0
+    total_pnl_pct = total_pnl_usd = 0.0
+    total_max_lose = total_max_dd = 0
 
-    msg += f"\n🪙 <b>Per Coin:</b>\n"
-    for cn in ["BTC", "ETH", "BNB"]:
-        s = day_stats.get("coin", {}).get(cn, new_stat())
-        if s["all_win"] + s["all_loss"] > 0:
-            msg += stat_line(s, cn)
+    for (strategy, asset), s in sorted(stats.items()):
+        total    = s["win"] + s["loss"]
+        wr       = (s["win"] / total * 100) if total > 0 else 0
+        total_win      += s["win"]
+        total_loss     += s["loss"]
+        total_pnl_pct  += s["pnl_pct"]
+        total_pnl_usd  += s["pnl_usd"]
+        total_max_lose  = max(total_max_lose, s["max_losestreak"])
+        total_max_dd    = max(total_max_dd,   s["max_drawdown_usd"])
 
-    # Total
-    total = new_stat()
-    for tf_key in ["15m", "1h"]:
-        for exh_key in ["EXH3", "EXH4", "EXH6"]:
-            s = day_stats.get(tf_key, {}).get(exh_key, new_stat())
-            for k in ["all_win","all_loss","odds_win","odds_loss"]:
-                total[k] += s[k]
-    msg += f"\n{stat_line(total, '📊 TOTAL')}"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"⚠️ <i>Data akumulasi — tidak direset tiap hari.</i>"
+        strat_label = strategy.split(" - ")[1] if " - " in strategy else strategy
+        pnl_sign = "+" if s["pnl_pct"] >= 0 else ""
+
+        # Streak icons
+        lose_icon = "🔴" * min(s["max_losestreak"], 5)
+        win_icon  = "🟢" * min(s["max_winstreak"], 5)
+
+        msg += (
+            f"\n📌 <b>{strat_label} | {asset}</b>\n"
+            f"   Trade    : {total} (✅{s['win']} ❌{s['loss']})\n"
+            f"   WR       : {wr:.1f}%\n"
+            f"   PnL      : {pnl_sign}{s['pnl_pct']:.1f}% ({pnl_sign}${s['pnl_usd']:.2f})\n"
+            f"   Win streak: {win_icon} max {s['max_winstreak']}x\n"
+            f"   Lose streak: {lose_icon} max {s['max_losestreak']}x\n"
+            f"   Max DD   : -${s['max_drawdown_usd']:.0f} (-{s['max_drawdown_pct']:.0f}%)\n"
+        )
+
+    total_all = total_win + total_loss
+    wr_all    = (total_win / total_all * 100) if total_all > 0 else 0
+    pnl_sign  = "+" if total_pnl_pct >= 0 else ""
+
+    msg += (
+        f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>TOTAL SEMUA STRATEGI</b>\n"
+        f"   Trade    : {total_all} (✅{total_win} ❌{total_loss})\n"
+        f"   WR       : {wr_all:.1f}%\n"
+        f"   PnL      : {pnl_sign}{total_pnl_pct:.1f}% ({pnl_sign}${total_pnl_usd:.2f})\n"
+        f"   Max Losestreak: {'🔴'*min(total_max_lose,5)} {total_max_lose}x berturut\n"
+        f"   Max Drawdown  : -${total_max_dd:.0f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ <i>Asumsi risk $100/trade (1%). Hasil aktual bisa berbeda.</i>"
+    )
     return msg
 
-def build_weekly_report(all_day_stats: list) -> str:
-    """Akumulasi semua day stats."""
-    msg  = f"📊 <b>WEEKLY REPORT ({len(all_day_stats)} hari)</b>\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
+# ============================================================
+# 🔄  OPEN TRADE MONITOR
+# Cek apakah trade aktif sudah kena TP atau SL
+# ============================================================
+_open_trades: list[dict] = []  # {id, symbol, type, entry, sl, tp, risk_usd}
 
-    # Akumulasi
-    weekly = {
-        "15m":  {"EXH3": new_stat(), "EXH4": new_stat(), "EXH6": new_stat()},
-        "1h":   {"EXH3": new_stat(), "EXH4": new_stat(), "EXH6": new_stat()},
-        "coin": {"BTC": new_stat(), "ETH": new_stat(), "BNB": new_stat()},
-    }
-    for ds in all_day_stats:
-        for tf_key in ["15m", "1h"]:
-            for exh_key in ["EXH3", "EXH4", "EXH6"]:
-                s  = ds.get(tf_key, {}).get(exh_key, new_stat())
-                ws = weekly[tf_key][exh_key]
-                for k in ["all_win","all_loss","odds_win","odds_loss"]:
-                    ws[k] += s[k]
-        for cn in ["BTC", "ETH", "BNB"]:
-            s  = ds.get("coin", {}).get(cn, new_stat())
-            ws = weekly["coin"][cn]
-            for k in ["all_win","all_loss","odds_win","odds_loss"]:
-                ws[k] += s[k]
+def monitor_open_trades():
+    """Cek setiap trade yang masih OPEN apakah sudah kena TP atau SL."""
+    global _open_trades
+    still_open = []
 
-    for tf_key, tf_label in [("15m","15M"), ("1h","1H")]:
-        msg += f"\n⏱️ <b>Timeframe {tf_label}:</b>\n"
-        for exh_key, exh_label in [("EXH3","Sideways EXH-3"),
-                                    ("EXH4","Sideways EXH-4"),
-                                    ("EXH6","Momentum EXH-6")]:
-            s = weekly[tf_key][exh_key]
-            if s["all_win"] + s["all_loss"] > 0:
-                msg += stat_line(s, exh_label)
+    for trade in _open_trades:
+        price = get_current_price(trade["symbol"])
+        if price is None:
+            still_open.append(trade)
+            continue
 
-    msg += f"\n🪙 <b>Per Coin:</b>\n"
-    for cn in ["BTC", "ETH", "BNB"]:
-        s = weekly["coin"][cn]
-        if s["all_win"] + s["all_loss"] > 0:
-            msg += stat_line(s, cn)
+        hit_tp = hit_sl = False
+        if trade["type"] == "LONG":
+            if price >= trade["tp"]:
+                hit_tp = True
+            elif price <= trade["sl"]:
+                hit_sl = True
+        else:
+            if price <= trade["tp"]:
+                hit_tp = True
+            elif price >= trade["sl"]:
+                hit_sl = True
 
-    total = new_stat()
-    for tf_key in ["15m", "1h"]:
-        for exh_key in ["EXH3", "EXH4", "EXH6"]:
-            s = weekly[tf_key][exh_key]
-            for k in ["all_win","all_loss","odds_win","odds_loss"]:
-                total[k] += s[k]
-    msg += f"\n{stat_line(total, '📊 TOTAL WEEKLY')}"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "♻️ <i>Data direset untuk minggu berikutnya.</i>"
-    return msg
+        if hit_tp or hit_sl:
+            result = "TP" if hit_tp else "SL"
+            update_signal_result(trade["id"], result, price, trade["risk_usd"])
 
-def check_streak_alert(name: str, tf: str, exh_key: str, results: list) -> str | None:
-    if len(results) < STREAK_ALERT_N:
-        return None
-    recent = results[-STREAK_ALERT_N:]
-    tf_label = TIMEFRAMES[tf]["label"]
-    if all(r is True for r in recent):
-        return (
-            f"🔥 <b>WIN STREAK [{tf_label}/{exh_key}]</b>\n"
-            f"   {name} — {STREAK_ALERT_N}x benar berturut!\n"
-            f"   🎯 On fire!"
-        )
-    if all(r is False for r in recent):
-        return (
-            f"⚠️ <b>LOSE STREAK [{tf_label}/{exh_key}]</b>\n"
-            f"   {name} — {STREAK_ALERT_N}x salah berturut!\n"
-            f"   🛑 Pertimbangkan pause."
-        )
-    return None
+            icon    = "🎯" if hit_tp else "🛑"
+            pnl_pct = RR_RATIO if hit_tp else -1.0
+            pnl_usd = trade["risk_usd"] * RR_RATIO if hit_tp else -trade["risk_usd"]
+            pnl_sign = "+" if pnl_pct > 0 else ""
+
+            send_telegram(
+                f"{icon} <b>TRADE CLOSED — {result}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 Aset    : {trade['asset']}\n"
+                f"📌 Tipe    : {'🔼 LONG' if trade['type']=='LONG' else '🔽 SHORT'}\n"
+                f"💰 Entry   : ${trade['entry']:.4f}\n"
+                f"💰 Close   : ${price:.4f}\n"
+                f"📐 Hasil   : <b>{result}</b>\n"
+                f"💵 PnL     : {pnl_sign}{pnl_pct:.1f}% ({pnl_sign}${pnl_usd:.2f})\n"
+                f"📌 Strategi: {trade['strategy']}"
+            )
+            log.info(f"  {'✅' if hit_tp else '❌'} {trade['asset']} {result} | PnL: {pnl_sign}{pnl_pct:.1f}%")
+
+            # ── Cek losestreak real-time ───────────────────────────────────────
+            streaks = get_alltime_streak()
+            key = (trade["strategy"], trade["asset"])
+            if key in streaks:
+                sk = streaks[key]
+                cur_lose = sk["cur_lose"]
+                cur_dd   = sk["cur_dd_usd"]
+
+                # Alert losestreak ≥ 3
+                if cur_lose >= 3:
+                    lose_icons = "🔴" * min(cur_lose, 7)
+                    send_telegram(
+                        f"⚠️ <b>LOSESTREAK ALERT!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 Aset    : {trade['asset']}\n"
+                        f"🎯 Strategi: {trade['strategy'].split(' - ')[1]}\n"
+                        f"🔴 Losestreak: {lose_icons} <b>{cur_lose}x berturut!</b>\n"
+                        f"💸 Drawdown : -${cur_dd:.0f} (-{cur_lose:.0f}%)\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🛑 <i>Pertimbangkan untuk pause trading sementara\n"
+                        f"dan evaluasi kondisi market.</i>"
+                    )
+
+                # Alert winstreak ≥ 3
+                if sk["cur_win"] >= 3:
+                    win_icons = "🟢" * min(sk["cur_win"], 7)
+                    send_telegram(
+                        f"🔥 <b>WINSTREAK!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 Aset    : {trade['asset']}\n"
+                        f"🎯 Strategi: {trade['strategy'].split(' - ')[1]}\n"
+                        f"🟢 Winstreak: {win_icons} <b>{sk['cur_win']}x berturut!</b>\n"
+                        f"🚀 <i>Strategi sedang on fire!</i>"
+                    )
+
+        else:
+            still_open.append(trade)
+
+    _open_trades = still_open
 
 # ============================================================
-# 🤖  MAIN BOT LOOP
+# 🚀  MAIN SCAN LOOP
 # ============================================================
-def make_day_stats() -> dict:
-    return {
-        "15m":  {"EXH3": new_stat(), "EXH4": new_stat(), "EXH6": new_stat()},
-        "1h":   {"EXH3": new_stat(), "EXH4": new_stat(), "EXH6": new_stat()},
-        "coin": {"BTC": new_stat(), "ETH": new_stat(), "BNB": new_stat()},
-    }
+_last_signals: dict = {}   # {(symbol, strategy): last_signal_ts} untuk deduplicate
+_last_report_date: str = ""
 
-def streak_key(streak_count: int) -> str:
-    if streak_count == 3:
-        return "EXH3"
-    if streak_count == 4:
-        return "EXH4"
-    return "EXH6"
+def should_send_signal(symbol: str, strategy: str) -> bool:
+    """Hindari mengirim sinyal yang sama dalam 1 jam."""
+    key    = (symbol, strategy)
+    now_ts = time.time()
+    last   = _last_signals.get(key, 0)
+    if now_ts - last < 3600:  # cooldown 1 jam
+        return False
+    _last_signals[key] = now_ts
+    return True
 
-def run_bot() -> None:
-    log.info("🚀 Polymarket Signal Bot v10 AKTIF")
-    log.info(f"   Coins    : {', '.join(c['name'] for c in COINS)}")
-    log.info(f"   TF       : 15M + 1H (bersamaan)")
-    log.info(f"   Sideways : ADX < {ADX_SIDEWAYS} → streak {SIDEWAYS_STREAK_1}/{SIDEWAYS_STREAK_2}")
-    log.info(f"   Momentum : ADX ≥ {ADX_SIDEWAYS} → streak {MOMENTUM_STREAK} (5+1 konfirmasi)")
-    log.info(f"   Odds tag : ≤{ODDS_THRESHOLD*100:.0f}¢ ditandai sebagai value bet")
-    log.info(f"   Report   : Day1–Day7 akumulasi → Weekly → Reset")
+def run_scan():
+    """Scan semua aset dengan kedua strategi."""
+    log.info("🔍 Mulai scan...")
 
-    # ── State ─────────────────────────────────────────────────────────────────
-    pending_signals: list[dict] = []
+    for asset in ASSETS:
+        symbol    = asset["symbol"]
+        name      = asset["name"]
+        risk_usd  = asset["risk_usd"]
 
-    # Exhaustion state per coin per TF
-    exh_state: dict = {
-        c["name"]: {tf: {"color": "", "count": 0} for tf in TIMEFRAMES}
-        for c in COINS
-    }
+        log.info(f"  📊 Scan {name} ({symbol})")
 
-    last_processed: dict = {}   # {(symbol, tf): last_open_ts_ms}
+        # Fetch data semua TF
+        df_30m = fetch_ohlcv(symbol, TF_HIGH,  limit=60)
+        df_5m  = fetch_ohlcv(symbol, TF_MID,   limit=60)
+        df_1m  = fetch_ohlcv(symbol, TF_LOW,   limit=20)
 
-    # Stats
-    current_day_stats   = make_day_stats()
-    all_day_stats: list = []   # list of day_stats, max 7
-    day_number          = 1
-    daily_report_sent   = None
-    result_history: dict = defaultdict(list)  # {(tf, exh_key): [True/False]}
+        if df_30m is None:
+            log.warning(f"  ⚠️ Data {name} {TF_HIGH} tidak tersedia.")
+            continue
 
-    wait = seconds_until_next_15m()
-    log.info(f"⏳ Scan pertama dalam {wait:.0f} detik...")
-    time.sleep(wait)
+        # ── Strategi 1: S/D Classic ───────────────────────────────────────────
+        zones = detect_sd_zones(df_30m)
+        log.debug(f"  Strategi 1: {len(zones)} zona valid ditemukan")
 
-    while True:
-        try:
-            now_utc   = datetime.now(tz=timezone.utc)
-            now_ts    = int(time.time())
-            today_str = now_utc.strftime("%Y-%m-%d")
+        sig1 = check_strategy1_entry(symbol, name, zones, df_5m, df_1m)
+        if sig1 and should_send_signal(symbol, "S1"):
+            sig_id = save_signal(
+                name, sig1["strategy"], sig1["type"],
+                sig1["entry"], sig1["sl"], sig1["tp"],
+                sig1["tf_confirm"],
+                notes=f"Zone: {sig1['zone']['type']} {sig1['zone']['zone_low']:.4f}-{sig1['zone']['zone_high']:.4f}"
+            )
+            send_telegram(build_signal_message(sig1))
+            _open_trades.append({
+                "id":       sig_id,
+                "symbol":   symbol,
+                "asset":    name,
+                "strategy": sig1["strategy"],
+                "type":     sig1["type"],
+                "entry":    sig1["entry"],
+                "sl":       sig1["sl"],
+                "tp":       sig1["tp"],
+                "risk_usd": risk_usd,
+            })
+            log.info(f"  📨 Sinyal S1 {name} {sig1['type']} dikirim (ID: {sig_id})")
 
-            # ── Daily Report (07:00 WIB = 00:00 UTC) ──────────────────────────
-            if now_utc.hour == DAILY_REPORT_HOUR and now_utc.minute < 6:
-                if daily_report_sent != today_str:
-                    # Kirim day report (akumulasi, tidak reset)
-                    send_telegram(build_day_report(day_number, current_day_stats))
-                    log.info(f"📊 Day {day_number} report dikirim.")
+        # ── Strategi 2: Fractal Scalping ──────────────────────────────────────
+        obs  = detect_order_blocks(df_30m)
+        log.debug(f"  Strategi 2: {len(obs)} OB valid ditemukan")
 
-                    all_day_stats.append(current_day_stats)
-                    day_number       += 1
-                    daily_report_sent = today_str
+        sig2 = check_strategy2_entry(symbol, name, obs, df_5m, df_1m)
+        if sig2 and should_send_signal(symbol, "S2"):
+            sig_id = save_signal(
+                name, sig2["strategy"], sig2["type"],
+                sig2["entry"], sig2["sl"], sig2["tp"],
+                sig2["tf_confirm"],
+                notes=f"OB: {sig2['ob']['type']} Q:{sig2['ob']['quality']}"
+            )
+            send_telegram(build_signal_message(sig2))
+            _open_trades.append({
+                "id":       sig_id,
+                "symbol":   symbol,
+                "asset":    name,
+                "strategy": sig2["strategy"],
+                "type":     sig2["type"],
+                "entry":    sig2["entry"],
+                "sl":       sig2["sl"],
+                "tp":       sig2["tp"],
+                "risk_usd": risk_usd,
+            })
+            log.info(f"  📨 Sinyal S2 {name} {sig2['type']} dikirim (ID: {sig_id})")
 
-                    # Weekly report setelah 7 hari → reset
-                    if len(all_day_stats) >= WEEKLY_DAYS:
-                        send_telegram(build_weekly_report(all_day_stats))
-                        log.info("📊 Weekly report dikirim → reset.")
-                        all_day_stats       = []
-                        current_day_stats   = make_day_stats()
-                        day_number          = 1
-                        result_history      = defaultdict(list)
+    # Monitor open trades
+    monitor_open_trades()
 
-            # ── Cek Hasil Pending ─────────────────────────────────────────────
-            still_pending = []
-            for ps in pending_signals:
-                if now_ts < ps["result_ready_ts"]:
-                    still_pending.append(ps)
-                    continue
+def check_daily_report():
+    """Kirim daily report jam 07:00 WIB (00:00 UTC)."""
+    global _last_report_date
+    now_utc   = datetime.now(tz=timezone.utc)
+    yesterday = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
 
-                log.info(f"  🏁 Result {ps['name']} [{TIMEFRAMES[ps['tf']]['label']}]")
-                result_price = fetch_current_price(ps["symbol"])
-                if result_price is None:
-                    still_pending.append(ps)
-                    continue
-
-                now_str = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-                send_telegram(build_result_message(ps, result_price, now_str))
-
-                is_win  = (result_price > ps["ref_price"]) if ps["signal"] == "UP" \
-                          else (result_price < ps["ref_price"])
-                tf      = ps["tf"]
-                cn      = ps["name"]
-                sk      = streak_key(ps["streak_count"])
-                has_odds = ps.get("our_odds") is not None
-                is_value = has_odds and ps["our_odds"] <= ODDS_THRESHOLD
-
-                def _update(stat: dict, win: bool, value: bool):
-                    if win:
-                        stat["all_win"] += 1
-                        if value:
-                            stat["odds_win"] += 1
-                    else:
-                        stat["all_loss"] += 1
-                        if value:
-                            stat["odds_loss"] += 1
-
-                _update(current_day_stats[tf][sk], is_win, is_value)
-                _update(current_day_stats["coin"][cn], is_win, is_value)
-
-                rh_key = (tf, sk)
-                result_history[rh_key].append(is_win)
-
-                if is_win:
-                    log.info(f"  ✅ {cn} [{TIMEFRAMES[tf]['label']}/{sk}] BENAR")
-                    # Reset exhaustion state jika menang
-                    exh_state[cn][tf] = {"color": "", "count": 0}
-                else:
-                    log.info(f"  ❌ {cn} [{TIMEFRAMES[tf]['label']}/{sk}] SALAH")
-                    # Update exhaustion state jika salah di sideways EXH-3
-                    if sk == "EXH3":
-                        exh_state[cn][tf] = {
-                            "color": ps["streak_color"],
-                            "count": SIDEWAYS_STREAK_1,
-                        }
-                        log.info(f"  ➕ {cn} {tf} siap EXH-4")
-                    else:
-                        exh_state[cn][tf] = {"color": "", "count": 0}
-
-                alert = check_streak_alert(cn, tf, sk, result_history[rh_key])
-                if alert:
-                    send_telegram(alert)
-
-            pending_signals = still_pending
-
-            # ── Scan Semua Coins × Timeframes ─────────────────────────────────
-            for coin in COINS:
-                for tf in TIMEFRAMES:
-                    key = (coin["symbol"], tf)
-                    tf_cfg = TIMEFRAMES[tf]
-
-                    candles = fetch_candles(
-                        coin["symbol"], tf,
-                        limit=tf_cfg["candles_needed"]
-                    )
-                    if not candles:
-                        continue
-
-                    last_open_ts = candles[-1][0]
-                    if last_processed.get(key) == last_open_ts:
-                        continue
-                    last_processed[key] = last_open_ts
-
-                    dt_c = datetime.fromtimestamp(
-                        last_open_ts / 1000, tz=timezone.utc
-                    ).strftime("%H:%M")
-                    log.info(f"🔍 {coin['name']} {tf_cfg['label']} [{dt_c} UTC]")
-
-                    # Deteksi kondisi market
-                    market = get_market_condition(candles)
-                    log.debug(
-                        f"  Kondisi: {market['condition']} "
-                        f"ADX:{market['adx']:.1f} "
-                        f"ATR_ratio:{market['atr_ratio']:.2f}"
-                    )
-
-                    # Deteksi exhaustion
-                    exh_st = exh_state[coin["name"]][tf]
-                    sig    = detect_exhaustion(candles, exh_st, market)
-
-                    if sig is None:
-                        # Reset state jika streak putus
-                        last_c    = candles[-1]
-                        exh_color = exh_st.get("color", "")
-                        if (exh_color == "GREEN" and last_c[4] < last_c[1]) or \
-                           (exh_color == "RED"   and last_c[4] >= last_c[1]):
-                            exh_state[coin["name"]][tf] = {"color": "", "count": 0}
-                        log.debug(f"  ↳ {coin['name']} {tf} — tidak ada sinyal.")
-                        continue
-
-                    # Update exhaustion state
-                    exh_state[coin["name"]][tf] = {
-                        "color": sig["streak_color"],
-                        "count": sig["streak_count"],
-                    }
-
-                    log.info(
-                        f"  🔔 {sig['signal']} [{streak_key(sig['streak_count'])}] "
-                        f"{coin['name']} {tf_cfg['label']} | {sig['condition']}"
-                    )
-
-                    # Fetch Polymarket odds (opsional, tidak jadi filter)
-                    odds = fetch_polymarket_odds(coin["name"], last_open_ts, tf)
-                    if odds:
-                        our_odds = odds["up"] if sig["signal"] == "UP" else odds["down"]
-                        log.info(
-                            f"  🎰 Odds: {our_odds*100:.0f}¢ "
-                            f"{'✅ VALUE' if our_odds <= ODDS_THRESHOLD else '⚠️ Mahal'}"
-                        )
-                    else:
-                        our_odds = None
-
-                    # Kirim sinyal (semua sinyal, odds hanya notif)
-                    ref_price    = sig["candle"][4]
-                    result_ready = get_result_ready_ts(last_open_ts, tf)
-                    window_end   = get_poly_window_end_utc(last_open_ts, tf)
-
-                    send_telegram(build_signal_message(
-                        sig=sig, name=coin["name"], tf=tf,
-                        open_ts_ms=last_open_ts, odds=odds,
-                    ))
-
-                    log.info(
-                        f"  📨 {coin['name']} {tf_cfg['label']} → "
-                        f"result {fmt_et(window_end)} ET"
-                    )
-
-                    pending_signals.append({
-                        "signal":          sig["signal"],
-                        "streak_color":    sig["streak_color"],
-                        "streak_count":    sig["streak_count"],
-                        "condition":       sig["condition"],
-                        "symbol":          coin["symbol"],
-                        "name":            coin["name"],
-                        "tf":              tf,
-                        "ref_price":       ref_price,
-                        "our_odds":        our_odds,
-                        "entry_time":      datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                        "result_ready_ts": result_ready,
-                        "window_end_utc":  window_end,
-                    })
-
-            wait = seconds_until_next_15m()
-            log.info(f"⏳ Scan berikutnya dalam {wait:.0f} detik...\n")
-            time.sleep(wait)
-
-        except KeyboardInterrupt:
-            log.info("🛑 Bot dihentikan. Sampai jumpa! 👋")
-            break
-        except Exception as e:
-            log.error(f"💥 Error: {e}", exc_info=True)
-            time.sleep(15)
+    if now_utc.hour == DAILY_REPORT_HOUR and now_utc.minute < 6:
+        if _last_report_date != yesterday:
+            stats = get_daily_stats(yesterday)
+            if stats:
+                send_telegram(build_daily_report(yesterday, stats))
+                log.info(f"📊 Daily report {yesterday} dikirim.")
+            else:
+                send_telegram(
+                    f"📊 <b>DAILY REPORT — {yesterday}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Tidak ada trade yang closed kemarin."
+                )
+            _last_report_date = yesterday
 
 # ============================================================
 # ▶️  ENTRY POINT
 # ============================================================
+def run_bot():
+    log.info("🚀 Trading Signal Bot AKTIF")
+    log.info(f"   Aset      : {', '.join(a['name'] for a in ASSETS)}")
+    log.info(f"   Strategi  : S/D Classic + Fractal Scalping")
+    log.info(f"   TF        : {TF_HIGH} / {TF_MID} / {TF_LOW}")
+    log.info(f"   Scan      : setiap {SCAN_INTERVAL_SEC//60} menit")
+    log.info(f"   RR        : 1:{RR_RATIO}")
+
+    # Init database
+    init_db()
+
+    # Kirim pesan startup
+    send_telegram(
+        "🤖 <b>Trading Signal Bot AKTIF</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Aset: BTC/USDT + XAUT/USDT (Gold)\n"
+        f"🎯 Strategi 1: Supply & Demand Classic\n"
+        f"🎯 Strategi 2: Fractal Scalping\n"
+        f"⏱️ TF: {TF_HIGH} → {TF_MID} → {TF_LOW}\n"
+        f"📐 RR: 1:{RR_RATIO}\n"
+        f"🔄 Scan setiap {SCAN_INTERVAL_SEC//60} menit\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ <i>Bukan rekomendasi investasi.</i>"
+    )
+
+    # Scan pertama langsung
+    try:
+        run_scan()
+    except Exception as e:
+        log.error(f"💥 Scan pertama error: {e}", exc_info=True)
+
+    # Loop utama
+    while True:
+        try:
+            time.sleep(SCAN_INTERVAL_SEC)
+            check_daily_report()
+            run_scan()
+        except KeyboardInterrupt:
+            log.info("🛑 Bot dihentikan. Sampai jumpa! 👋")
+            break
+        except Exception as e:
+            log.error(f"💥 Error di loop utama: {e}", exc_info=True)
+            time.sleep(30)
+
 if __name__ == "__main__":
     run_bot()
