@@ -56,6 +56,21 @@ SCAN_INTERVAL_SEC = 300; DAILY_REPORT_HOUR = 0
 SIGNAL_COOLDOWN_H = 2; DB_PATH = "signals.db"; LOG_FILE = "bot.log"
 MAX_RETRIES = 3
 
+# ── Twelve Data rate limit strategy ──────────────────────────────────────────
+# Free plan: 800 credits/day, 8 req/menit
+# Setiap request ke /time_series = 1 credit
+# Solusi: batch request (1 call untuk semua pair) + delay antar batch
+#
+# Hitung kebutuhan per scan:
+#   4 pair forex × 3 TF = 12 req → pakai batch → 3 req (1 per TF)
+#   1 pair BTC via Binance = 0 req Twelve Data
+#   Monitor harga: pakai close candle TF1 terakhir → 0 req tambahan
+#   Total per scan: 3 req Twelve Data
+#   Scan tiap 5 menit = 3 req per 5 menit = 0.6 req/menit ✅ jauh di bawah 8
+#
+TWELVE_REQ_DELAY  = 10.0  # detik antar request, safety margin
+_last_twelve_req  = 0.0
+
 # Pip sizes
 PIP_SIZE = {"EURUSD":0.0001,"GBPUSD":0.0001,"USDJPY":0.01,
             "XAUUSD":0.01,"BTCUSD":1.00}
@@ -180,26 +195,78 @@ def calc_lot(pair, pips_r) -> float:
     lot = RISK_PER_TRADE_USD / (pips_r * lpv)
     return max(0.01, round(lot / 0.01) * 0.01)
 
-def fetch_twelve(sym_td, interval, limit=80):
+def _twelve_rate_limit():
+    """Pastikan jeda minimal TWELVE_REQ_DELAY detik antar request Twelve Data."""
+    global _last_twelve_req
+    elapsed = time.time() - _last_twelve_req
+    if elapsed < TWELVE_REQ_DELAY:
+        wait = TWELVE_REQ_DELAY - elapsed
+        log.debug(f"  Rate limit: tunggu {wait:.1f}s")
+        time.sleep(wait)
+    _last_twelve_req = time.time()
+
+def fetch_twelve_batch(symbols: list, interval: str, limit: int = 80) -> dict:
+    """
+    Batch request Twelve Data — 1 request untuk semua pair sekaligus.
+    Hemat credit: 4 pair = 1 request (bukan 4 request).
+    Returns: {symbol: DataFrame} atau {} jika gagal.
+    """
+    _twelve_rate_limit()
+    sym_str = ",".join(symbols)  # "EUR/USD,GBP/USD,USD/JPY,XAU/USD"
     for attempt in range(1, MAX_RETRIES+1):
         try:
             r = requests.get(TWELVE_DATA_URL, params={
-                "symbol":sym_td,"interval":interval,
-                "outputsize":limit+1,"apikey":TWELVE_DATA_KEY,"format":"JSON"
-            }, timeout=15); r.raise_for_status()
+                "symbol": sym_str, "interval": interval,
+                "outputsize": limit+1, "apikey": TWELVE_DATA_KEY, "format": "JSON"
+            }, timeout=20); r.raise_for_status()
             d = r.json()
-            if "values" not in d:
-                log.warning(f"Twelve Data {sym_td}: {d.get('message','no data')}"); return None
-            df = pd.DataFrame(d["values"]).rename(columns={"datetime":"timestamp"})
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-            for c in ["open","high","low","close","volume"]:
-                df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            return df.iloc[:-1]
+
+            # Cek rate limit
+            if isinstance(d, dict) and ("You have run" in str(d.get("message",""))):
+                log.warning(f"  Rate limit Twelve Data — tunggu 65 detik...")
+                time.sleep(65); continue
+
+            result = {}
+
+            # Jika hanya 1 symbol, response langsung berupa dict dengan "values"
+            # Jika multi-symbol, response berupa {sym: {values: [...]}}
+            if len(symbols) == 1:
+                sym = symbols[0]
+                if "values" in d:
+                    result[sym] = _parse_twelve_df(d)
+            else:
+                for sym in symbols:
+                    sym_data = d.get(sym, {})
+                    if "values" in sym_data:
+                        result[sym] = _parse_twelve_df(sym_data)
+                    else:
+                        msg = sym_data.get("message","no data") if isinstance(sym_data,dict) else "no data"
+                        log.warning(f"  Twelve Data {sym} {interval}: {msg}")
+
+            return result
+
         except Exception as e:
-            log.warning(f"Twelve {sym_td} {interval} attempt {attempt}: {e}")
-            if attempt < MAX_RETRIES: time.sleep(5)
-    return None
+            log.warning(f"Twelve batch {interval} attempt {attempt}: {e}")
+            if attempt < MAX_RETRIES: time.sleep(8)
+    return {}
+
+def _parse_twelve_df(data: dict) -> pd.DataFrame | None:
+    """Parse response Twelve Data menjadi DataFrame."""
+    try:
+        df = pd.DataFrame(data["values"]).rename(columns={"datetime":"timestamp"})
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        return df.iloc[:-1]  # buang candle live
+    except Exception as e:
+        log.warning(f"  Parse Twelve Data error: {e}")
+        return None
+
+def fetch_twelve(sym_td, interval, limit=80):
+    """Single fetch — dipakai jika batch tidak tersedia."""
+    result = fetch_twelve_batch([sym_td], interval, limit)
+    return result.get(sym_td)
 
 def fetch_binance(sym_bn, interval, limit=80):
     for attempt in range(1, MAX_RETRIES+1):
@@ -223,14 +290,31 @@ def fetch_ohlcv(asset, tf_td, tf_bn, limit=80):
     return fetch_twelve(asset["sym_td"], tf_td, limit)
 
 def get_price(asset):
+    """
+    Ambil harga terkini.
+    BTC: Binance Vision (gratis, no limit)
+    Forex/Gold: Ambil dari cache TF1 terakhir yang sudah di-fetch saat scan.
+                Hemat credit — tidak perlu request /price terpisah.
+    """
     try:
         if asset["source"]=="binance":
             r = requests.get(BINANCE_TICKER_URL,params={"symbol":asset["sym_bn"]},timeout=10)
             return float(r.json()["price"])
-        r = requests.get(TWELVE_PRICE_URL,
-            params={"symbol":asset["sym_td"],"apikey":TWELVE_DATA_KEY},timeout=10)
-        return float(r.json()["price"])
+        # Untuk forex/gold: gunakan close candle TF1 dari cache
+        name = asset["name"]
+        if name in _price_cache:
+            return _price_cache[name]
+        # Fallback: fetch TF1 terbaru (1 request, hemat vs /price)
+        df1 = fetch_twelve(asset["sym_td"], TF_LOW, limit=5)
+        if df1 is not None and len(df1) > 0:
+            price = float(df1["close"].iloc[-1])
+            _price_cache[name] = price
+            return price
+        return None
     except: return None
+
+# Cache harga dari TF1 saat scan — di-update tiap scan, dipakai monitor
+_price_cache: dict = {}
 
 # ============================================================
 # INDICATORS
@@ -544,10 +628,27 @@ def daily_msg(date_str, stats):
 # ============================================================
 _open_trades = []
 
+# Cache harga per pair agar tidak double-request saat ada banyak open trade
+_price_cache: dict = {}
+_price_cache_ts: dict = {}
+PRICE_CACHE_SEC = 30  # cache harga selama 30 detik
+
+def get_cached_price(asset) -> float | None:
+    """Ambil harga dengan cache — hindari request berulang per pair."""
+    name = asset["name"]
+    now  = time.time()
+    if name in _price_cache and now - _price_cache_ts.get(name, 0) < PRICE_CACHE_SEC:
+        return _price_cache[name]
+    price = get_price(asset)
+    if price:
+        _price_cache[name]    = price
+        _price_cache_ts[name] = now
+    return price
+
 def monitor():
     global _open_trades; still=[]
     for t in _open_trades:
-        price=get_price(t["asset"])
+        price=get_cached_price(t["asset"])
         if price is None: still.append(t); continue
         hit_tp = price>=t["tp"] if t["sig"]=="BUY" else price<=t["tp"]
         hit_sl = price<=t["sl"] if t["sig"]=="BUY" else price>=t["sl"]
@@ -585,12 +686,52 @@ def can_send(pair,code):
 # MAIN SCAN
 # ============================================================
 def scan():
-    log.info("Scan 5 pairs x 3 strategies...")
+    """
+    Scan 5 pair × 3 strategi.
+    Optimasi kredit Twelve Data:
+    - Batch fetch: 1 request untuk semua 4 pair forex per TF
+    - Total: 3 request Twelve Data per scan (TF30, TF5, TF1)
+    - BTC via Binance Vision = 0 kredit Twelve Data
+    - Harga monitor disimpan di _price_cache dari TF1
+    """
+    global _price_cache
+    log.info("Scan 5 pairs x 3 strategies (batch mode)...")
+
+    # ── Batch fetch semua pair forex sekaligus (3 request total) ─────────────
+    forex_assets = [a for a in ASSETS if a["source"]=="twelve"]
+    forex_syms   = [a["sym_td"] for a in forex_assets]
+
+    log.info(f"  Fetching TF30 batch ({len(forex_syms)} pairs)...")
+    batch30 = fetch_twelve_batch(forex_syms, TF_HIGH, limit=60)
+    time.sleep(TWELVE_REQ_DELAY)  # jaga rate limit antar batch
+
+    log.info(f"  Fetching TF5 batch...")
+    batch5  = fetch_twelve_batch(forex_syms, TF_MID,  limit=40)
+    time.sleep(TWELVE_REQ_DELAY)
+
+    log.info(f"  Fetching TF1 batch (juga untuk harga monitor)...")
+    batch1  = fetch_twelve_batch(forex_syms, TF_LOW,  limit=15)
+
+    # Update price cache dari TF1
+    for fa in forex_assets:
+        df1 = batch1.get(fa["sym_td"])
+        if df1 is not None and len(df1) > 0:
+            _price_cache[fa["name"]] = float(df1["close"].iloc[-1])
+
+    log.info(f"  Batch selesai. Credit dipakai: 3 request Twelve Data.")
+
     for asset in ASSETS:
         name=asset["name"]; log.info(f"  {name}")
-        df30=fetch_ohlcv(asset,TF_HIGH,TF_H_BN,80)
-        df5 =fetch_ohlcv(asset,TF_MID, TF_M_BN,60)
-        df1 =fetch_ohlcv(asset,TF_LOW, TF_L_BN,20)
+        if asset["source"]=="twelve":
+            df30 = batch30.get(asset["sym_td"])
+            df5  = batch5.get(asset["sym_td"])
+            df1  = batch1.get(asset["sym_td"])
+        else:
+            # BTC via Binance Vision
+            df30 = fetch_binance(asset["sym_bn"], TF_H_BN, 60)
+            df5  = fetch_binance(asset["sym_bn"], TF_M_BN, 40)
+            df1  = fetch_binance(asset["sym_bn"], TF_L_BN, 15)
+
         if df30 is None: log.warning(f"  No data {name}"); continue
 
         def send_sig(sig, code):
