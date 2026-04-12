@@ -52,7 +52,7 @@ MA_FAST = 9;     MA_SLOW  = 21; STRONG_LEG_MULT = 1.5
 VOLUME_LOOKBACK = 20
 
 # Bot config
-SCAN_INTERVAL_SEC = 300; DAILY_REPORT_HOUR = 0
+SCAN_INTERVAL_SEC = 900; DAILY_REPORT_HOUR = 0  # 15 menit = 96 scan/hari
 SIGNAL_COOLDOWN_H = 2; DB_PATH = "signals.db"; LOG_FILE = "bot.log"
 MAX_RETRIES = 3
 
@@ -685,72 +685,157 @@ def can_send(pair,code):
 # ============================================================
 # MAIN SCAN
 # ============================================================
+def has_active_trade(pair: str) -> bool:
+    """Cek apakah pair ini masih punya open trade."""
+    return any(t["pair"] == pair for t in _open_trades)
+
 def scan():
     """
-    Scan 5 pair × 3 strategi.
-    Optimasi kredit Twelve Data:
-    - Batch fetch: 1 request untuk semua 4 pair forex per TF
-    - Total: 3 request Twelve Data per scan (TF30, TF5, TF1)
-    - BTC via Binance Vision = 0 kredit Twelve Data
-    - Harga monitor disimpan di _price_cache dari TF1
+    SCAN 2-FASE untuk hemat API credit Twelve Data:
+
+    FASE 1 — TF30 screening (1 request batch untuk semua pair):
+      Fetch hanya TF30. Deteksi zona potensial (imbalance/S&D/pullback).
+      Jika tidak ada zona → SKIP pair ini, tidak fetch TF5/TF1.
+      Credit dipakai: 1 request untuk semua 4 pair forex (batch).
+
+    FASE 2 — TF5 + TF1 (hanya jika ada zona di TF30):
+      Fetch TF5 dan TF1 hanya untuk pair yang punya zona aktif.
+      Credit dipakai: 2 request per pair yang lolos screening.
+
+    Monitor open trade:
+      Cek TP/SL hanya jika ada open trade.
+      Harga dari TF1 yang sudah difetch (tidak request tambahan).
+
+    Estimasi penggunaan harian:
+      Worst case (semua pair punya zona): 1 + 4×2 = 9 req/scan
+      Typical case (1-2 pair punya zona): 1 + 2×2 = 5 req/scan
+      Scan per hari: 24×60/5 = 288 scan
+      Typical daily: 288 × 5 = 1,440 req → masih melebihi limit 800
+
+      Solusi tambahan: scan interval diperpanjang ke 15 menit
+      → 96 scan/hari × worst 9 = 864 req (mendekati limit)
+      → Typical 96 × 5 = 480 req/hari (aman di bawah 800)
     """
     global _price_cache
-    log.info("Scan 5 pairs x 3 strategies (batch mode)...")
+    log.info("=== SCAN DIMULAI ===")
 
-    # ── Batch fetch semua pair forex sekaligus (3 request total) ─────────────
+    # ════════════════════════════════════════════════════════════
+    # FASE 1: Fetch TF30 saja untuk semua pair forex (1 batch req)
+    # ════════════════════════════════════════════════════════════
     forex_assets = [a for a in ASSETS if a["source"]=="twelve"]
     forex_syms   = [a["sym_td"] for a in forex_assets]
 
-    log.info(f"  Fetching TF30 batch ({len(forex_syms)} pairs)...")
+    log.info(f"  Fase 1: Fetch TF30 ({len(forex_syms)} pairs, 1 request)...")
     batch30 = fetch_twelve_batch(forex_syms, TF_HIGH, limit=60)
-    time.sleep(TWELVE_REQ_DELAY)  # jaga rate limit antar batch
 
-    log.info(f"  Fetching TF5 batch...")
-    batch5  = fetch_twelve_batch(forex_syms, TF_MID,  limit=40)
-    time.sleep(TWELVE_REQ_DELAY)
-
-    log.info(f"  Fetching TF1 batch (juga untuk harga monitor)...")
-    batch1  = fetch_twelve_batch(forex_syms, TF_LOW,  limit=15)
-
-    # Update price cache dari TF1
-    for fa in forex_assets:
-        df1 = batch1.get(fa["sym_td"])
-        if df1 is not None and len(df1) > 0:
-            _price_cache[fa["name"]] = float(df1["close"].iloc[-1])
-
-    log.info(f"  Batch selesai. Credit dipakai: 3 request Twelve Data.")
-
+    # Screening: pair mana yang punya zona potensial?
+    pairs_with_zones = []
     for asset in ASSETS:
-        name=asset["name"]; log.info(f"  {name}")
-        if asset["source"]=="twelve":
+        name = asset["name"]
+        if asset["source"] == "twelve":
             df30 = batch30.get(asset["sym_td"])
-            df5  = batch5.get(asset["sym_td"])
-            df1  = batch1.get(asset["sym_td"])
         else:
-            # BTC via Binance Vision
+            # BTC — Binance Vision tidak pakai kredit Twelve Data
             df30 = fetch_binance(asset["sym_bn"], TF_H_BN, 60)
-            df5  = fetch_binance(asset["sym_bn"], TF_M_BN, 40)
-            df1  = fetch_binance(asset["sym_bn"], TF_L_BN, 15)
 
-        if df30 is None: log.warning(f"  No data {name}"); continue
+        if df30 is None:
+            log.debug(f"  {name}: no TF30 data, skip")
+            continue
 
-        def send_sig(sig, code):
-            if sig and can_send(name, code):
+        # Cek apakah ada zona potensial di TF30
+        z1 = s1_zones(df30, name)
+        z2 = s2_zones(df30, name)
+        z3 = s3_zones(df30, name)
+        has_zone   = bool(z1 or z2 or z3)
+        has_trade  = has_active_trade(name)
+
+        if has_zone or has_trade:
+            reason = []
+            if z1: reason.append(f"S1:{len(z1)}zona")
+            if z2: reason.append(f"S2:{len(z2)}zona")
+            if z3: reason.append(f"S3:{len(z3)}zona")
+            if has_trade: reason.append("open_trade")
+            log.info(f"  {name}: AKTIF ({', '.join(reason)}) → fetch TF5+TF1")
+            pairs_with_zones.append({
+                "asset": asset, "df30": df30,
+                "z1": z1, "z2": z2, "z3": z3,
+                "has_trade": has_trade,
+            })
+        else:
+            log.info(f"  {name}: tidak ada zona → SKIP (hemat 2 request)")
+
+    if not pairs_with_zones:
+        log.info("  Tidak ada pair aktif. Scan selesai. Credit dipakai: 1 request.")
+        return
+
+    # ════════════════════════════════════════════════════════════
+    # FASE 2: Fetch TF5 + TF1 hanya untuk pair yang punya zona
+    # ════════════════════════════════════════════════════════════
+    # Kumpulkan pair forex yang butuh TF5/TF1
+    active_forex = [p for p in pairs_with_zones if p["asset"]["source"]=="twelve"]
+    active_forex_syms = [p["asset"]["sym_td"] for p in active_forex]
+
+    batch5 = {}; batch1 = {}
+    if active_forex_syms:
+        log.info(f"  Fase 2: Fetch TF5 ({len(active_forex_syms)} pairs)...")
+        batch5 = fetch_twelve_batch(active_forex_syms, TF_MID, limit=40)
+        time.sleep(TWELVE_REQ_DELAY)
+        log.info(f"  Fase 2: Fetch TF1 ({len(active_forex_syms)} pairs)...")
+        batch1 = fetch_twelve_batch(active_forex_syms, TF_LOW, limit=15)
+
+        # Update price cache dari TF1
+        for p in active_forex:
+            df1 = batch1.get(p["asset"]["sym_td"])
+            if df1 is not None and len(df1) > 0:
+                _price_cache[p["asset"]["name"]] = float(df1["close"].iloc[-1])
+
+    total_req = 1 + (2 if active_forex_syms else 0)
+    log.info(f"  Fase 2 selesai. Total credit dipakai: ~{total_req} request.")
+
+    # ════════════════════════════════════════════════════════════
+    # Proses entry untuk setiap pair aktif
+    # ════════════════════════════════════════════════════════════
+    for pdata in pairs_with_zones:
+        asset = pdata["asset"]
+        name  = asset["name"]
+        df30  = pdata["df30"]
+
+        if asset["source"] == "twelve":
+            df5 = batch5.get(asset["sym_td"])
+            df1 = batch1.get(asset["sym_td"])
+        else:
+            # BTC — fetch TF5/TF1 dari Binance (gratis)
+            df5 = fetch_binance(asset["sym_bn"], TF_M_BN, 40)
+            df1 = fetch_binance(asset["sym_bn"], TF_L_BN, 15)
+
+        if df5 is None or df1 is None:
+            log.warning(f"  {name}: TF5/TF1 tidak tersedia")
+            continue
+
+        # Update price cache dari TF1
+        if asset["source"] == "binance" and len(df1) > 0:
+            _price_cache[name] = float(df1["close"].iloc[-1])
+
+        def send_sig(sig, code, _name=name, _asset=asset):
+            if sig and can_send(_name, code):
                 sid=save_signal(sig["pair"],sig["strategy"],sig["sig"],
                     sig["entry"],sig["sl"],sig["tp"],sig["tf_confirm"],
                     lot=sig.get("lot",0),pips_r=sig.get("pr",0),
                     zh=sig.get("zh"),zl=sig.get("zl"),notes=sig.get("notes",""))
                 send_tg(sig_msg(sig))
-                _open_trades.append({"id":sid,"pair":sig["pair"],"strategy":sig["strategy"],
-                    "sig":sig["sig"],"entry":sig["entry"],"sl":sig["sl"],"tp":sig["tp"],
-                    "asset":asset})
-                log.info(f"  [{code}] {name} {sig['sig']} sent ID:{sid}")
+                _open_trades.append({"id":sid,"pair":sig["pair"],
+                    "strategy":sig["strategy"],"sig":sig["sig"],
+                    "entry":sig["entry"],"sl":sig["sl"],"tp":sig["tp"],
+                    "asset":_asset})
+                log.info(f"  [{code}] {_name} {sig['sig']} sent ID:{sid}")
 
-        send_sig(s1_entry(name, s1_zones(df30,name), df5, df1), "S1")
-        send_sig(s2_entry(name, s2_zones(df30,name), df5, df1), "S2")
-        send_sig(s3_entry(name, s3_zones(df30,name), df5, df1), "S3")
+        send_sig(s1_entry(name, pdata["z1"], df5, df1), "S1")
+        send_sig(s2_entry(name, pdata["z2"], df5, df1), "S2")
+        send_sig(s3_entry(name, pdata["z3"], df5, df1), "S3")
 
+    # Monitor open trade (pakai price cache, tidak request baru)
     monitor()
+    log.info("=== SCAN SELESAI ===")
 
 # ============================================================
 # DAILY REPORT
