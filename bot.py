@@ -75,9 +75,29 @@ _last_twelve_req  = 0.0
 PIP_SIZE = {"EURUSD":0.0001,"GBPUSD":0.0001,"USDJPY":0.01,
             "XAUUSD":0.01,"BTCUSD":1.00}
 
-# Lot value per pip per 0.01 lot (cent account)
-LOT_VALUE_PER_PIP = {"EURUSD":0.001,"GBPUSD":0.001,"USDJPY":0.001,
-                     "XAUUSD":0.01,"BTCUSD":0.1}
+# ── Lot value per pip untuk akun CENT ────────────────────────────────────────
+# Akun cent: 1 lot cent = 0.01 lot standard = 1,000 unit
+#
+# Cara hitung nilai pip per 1 lot cent (dalam USD):
+#   EURUSD : 1 pip = 0.0001 × 1,000 unit = $0.10 per lot cent
+#   GBPUSD : sama dengan EURUSD = $0.10 per lot cent
+#   USDJPY : 1 pip = 0.01 JPY × 1,000 / USDJPY_rate
+#            ≈ 10 JPY / 150 ≈ $0.067 per lot cent → pakai $0.07
+#   XAUUSD : 1 pip = 0.01 USD × 1,000 = $10 per lot standard
+#            per lot cent = $10 × 0.01 = $0.10 per lot cent
+#   BTCUSD : 1 pip = $1 × 1,000 unit... perlu verifikasi broker
+#
+# Contoh: USDJPY SL=10pips, Risk=$20
+#   Lot = $20 / (10pips × $0.07) = 28.6 lot cent
+#
+# SAFETY CAP: MAX_LOT memastikan lot tidak absurd
+LOT_VALUE_PER_PIP = {"EURUSD":0.10,"GBPUSD":0.10,"USDJPY":0.07,
+                     "XAUUSD":0.10,"BTCUSD":0.10}
+
+# Batas maksimum lot per trade — WAJIB ada untuk safety
+# Sesuaikan dengan margin yang tersedia di akun $300 cent
+MAX_LOT = {"EURUSD":10.0,"GBPUSD":10.0,"USDJPY":10.0,
+           "XAUUSD": 5.0,"BTCUSD": 2.0}
 
 ASSETS = [
     {"name":"EURUSD","source":"twelve","sym_td":"EUR/USD","sym_bn":None},
@@ -137,7 +157,12 @@ def save_signal(pair, strategy, sig_type, entry, sl, tp, tf_confirm,
     sid = cur.lastrowid; conn.commit(); conn.close(); return sid
 
 def update_result(sid: int, result: str):
-    pnl_usd = RISK_PER_TRADE_USD * RR_RATIO if result=="TP" else -RISK_PER_TRADE_USD
+    if result == "EXPIRED":
+        pnl_usd = 0.0   # tidak ada P&L jika order tidak kena
+    elif result == "TP":
+        pnl_usd = RISK_PER_TRADE_USD * RR_RATIO
+    else:
+        pnl_usd = -RISK_PER_TRADE_USD
     pnl_pct = pnl_usd / ACCOUNT_BALANCE * 100
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
     cur.execute("UPDATE signals SET status='CLOSED',result=?,pnl_pct=?,pnl_usd=?,close_time=? WHERE id=?",
@@ -190,10 +215,36 @@ def p2price(pair, n): return n * pip(pair)
 def price2p(pair, diff): return abs(diff) / pip(pair)
 
 def calc_lot(pair, pips_r) -> float:
-    lpv = LOT_VALUE_PER_PIP.get(pair, 0.001)
-    if pips_r <= 0 or lpv <= 0: return 0.01
-    lot = RISK_PER_TRADE_USD / (pips_r * lpv)
-    return max(0.01, round(lot / 0.01) * 0.01)
+    """
+    Hitung lot size akun cent.
+    Lot = Risk_USD / (pips_SL × lot_value_per_pip)
+
+    Di-cap ketat oleh MAX_LOT untuk mencegah lot absurd.
+    Jika SL terlalu kecil (pips_r < 3), gunakan minimum 3 pips
+    untuk menghindari lot yang sangat besar.
+    """
+    lpv     = LOT_VALUE_PER_PIP.get(pair, 0.10)
+    max_lot = MAX_LOT.get(pair, 10.0)
+
+    # Pastikan pips_r tidak terlalu kecil (min 3 pips untuk keamanan)
+    effective_pips = max(pips_r, 3.0)
+
+    if effective_pips <= 0 or lpv <= 0:
+        return 0.01
+
+    lot = RISK_PER_TRADE_USD / (effective_pips * lpv)
+    lot = round(lot / 0.01) * 0.01   # bulatkan ke 0.01
+    lot_raw = lot
+
+    # Cap wajib — jangan sampai lot melebihi MAX_LOT
+    lot = max(0.01, min(lot, max_lot))
+
+    if lot < lot_raw:
+        log.warning(
+            f"  Lot {pair} di-cap: {lot_raw:.2f} → {lot:.2f} lot cent "
+            f"(SL={pips_r:.1f}pips, MAX={max_lot})"
+        )
+    return lot
 
 def _twelve_rate_limit():
     """Pastikan jeda minimal TWELVE_REQ_DELAY detik antar request Twelve Data."""
@@ -700,33 +751,102 @@ def get_cached_price(asset) -> float | None:
         _price_cache_ts[name] = now
     return price
 
+# Waktu toleransi entry limit order (15 menit = 900 detik)
+# Jika dalam 15 menit harga tidak menyentuh entry, anggap order tidak kena
+ENTRY_TIMEOUT_SEC = int(os.getenv("ENTRY_TIMEOUT_SEC", "900"))
+
 def monitor():
+    """
+    Monitor open trade dengan 2 tahap:
+
+    TAHAP 1 — Cek apakah entry sudah kena:
+      Trade dipasang sebagai limit order.
+      Entry BUY kena jika harga <= entry (harga turun ke limit).
+      Entry SELL kena jika harga >= entry (harga naik ke limit).
+      Jika belum kena dan sudah timeout → batalkan trade.
+
+    TAHAP 2 — Cek TP/SL (hanya jika entry sudah kena):
+      Entry BUY: TP jika price >= tp, SL jika price <= sl.
+      Entry SELL: TP jika price <= tp, SL jika price >= sl.
+    """
     global _open_trades; still=[]
+    now_ts = time.time()
+
     for t in _open_trades:
-        price=get_cached_price(t["asset"])
-        if price is None: still.append(t); continue
-        hit_tp = price>=t["tp"] if t["sig"]=="BUY" else price<=t["tp"]
-        hit_sl = price<=t["sl"] if t["sig"]=="BUY" else price>=t["sl"]
+        price = get_cached_price(t["asset"])
+        if price is None:
+            still.append(t); continue
+
+        entry     = t["entry"]
+        sig       = t["sig"]
+        entry_ts  = t.get("entry_ts", now_ts)
+        filled    = t.get("filled", False)
+
+        # ── TAHAP 1: Cek apakah limit order sudah kena ────────────────────────
+        if not filled:
+            # BUY limit: kena jika harga turun ke atau di bawah entry
+            # SELL limit: kena jika harga naik ke atau di atas entry
+            entry_hit = (
+                (sig == "BUY"  and price <= entry * 1.0002) or  # toleransi 0.02%
+                (sig == "SELL" and price >= entry * 0.9998)
+            )
+            if entry_hit:
+                t["filled"]    = True
+                t["fill_price"] = price
+                t["fill_ts"]   = now_ts
+                log.info(f"  ✅ {t['pair']} entry KENA @ ${price:.5f} (limit {sig} @ ${entry:.5f})")
+                send_tg(
+                    "✅ <b>ENTRY KENA!</b>\n"
+                    f"💱 {t['pair']} | {'🔼 BUY' if sig=='BUY' else '🔽 SELL'}\n"
+                    f"💰 Fill Price: ${price:.5f}\n"
+                    f"🛑 SL: ${t['sl']:.5f} | 🎯 TP: ${t['tp']:.5f}\n"
+                    "⏳ Menunggu TP/SL..."
+                )
+                still.append(t)
+            elif now_ts - entry_ts > ENTRY_TIMEOUT_SEC:
+                # Timeout — order tidak kena dalam batas waktu
+                log.info(f"  ⏰ {t['pair']} order TIMEOUT ({ENTRY_TIMEOUT_SEC//60} menit) — dibatalkan")
+                send_tg(
+                    "⏰ <b>ORDER EXPIRED</b>\n"
+                    f"💱 {t['pair']} | {'🔼 BUY' if sig=='BUY' else '🔽 SELL'}\n"
+                    f"💰 Limit order @ ${entry:.5f} tidak kena\n"
+                    f"   Harga sekarang: ${price:.5f}\n"
+                    "❌ Order dibatalkan otomatis."
+                )
+                update_result(t["id"], "EXPIRED")
+                # Tidak masuk still → trade dihapus dari open
+            else:
+                elapsed = int(now_ts - entry_ts)
+                log.debug(f"  ⏳ {t['pair']} menunggu entry ({elapsed}s/{ENTRY_TIMEOUT_SEC}s) price={price:.5f} entry={entry:.5f}")
+                still.append(t)
+            continue
+
+        # ── TAHAP 2: Cek TP/SL (entry sudah kena) ─────────────────────────────
+        hit_tp = price >= t["tp"] if sig == "BUY" else price <= t["tp"]
+        hit_sl = price <= t["sl"] if sig == "BUY" else price >= t["sl"]
+
         if hit_tp or hit_sl:
-            res="TP" if hit_tp else "SL"
-            update_result(t["id"],res)
-            send_tg(result_msg(t,res,price))
-            log.info(f"  {'✅' if hit_tp else '❌'} {t['pair']} {res}")
-            sk=get_alltime_streak(); k=(t["strategy"],t["pair"])
+            res = "TP" if hit_tp else "SL"
+            update_result(t["id"], res)
+            send_tg(result_msg(t, res, price))
+            log.info(f"  {'✅' if hit_tp else '❌'} {t['pair']} {res} @ ${price:.5f}")
+            sk = get_alltime_streak(); k = (t["strategy"], t["pair"])
             if k in sk:
-                s=sk[k]
-                if s["cl"]>=3:
-                    icons="🔴"*min(s["cl"],7)
+                s = sk[k]
+                if s["cl"] >= 3:
+                    icons = "🔴" * min(s["cl"], 7)
                     send_tg(f"⚠️ <b>LOSESTREAK!</b>\n"
                             f"💱 {t['pair']} | {t['strategy']}\n"
                             f"{icons} <b>{s['cl']}x berturut!</b>\n"
                             f"💸 Drawdown: -${s['cd']:.0f}\n"
                             f"🛑 Pertimbangkan pause & evaluasi.")
-                if s["cw"]>=3:
-                    icons="🟢"*min(s["cw"],7)
+                if s["cw"] >= 3:
+                    icons = "🟢" * min(s["cw"], 7)
                     send_tg(f"🔥 <b>WINSTREAK!</b> {t['pair']} {s['cw']}x! {icons}")
-        else: still.append(t)
-    _open_trades=still
+        else:
+            still.append(t)
+
+    _open_trades = still
 
 # ============================================================
 # SIGNAL COOLDOWN
@@ -878,10 +998,18 @@ def scan():
                     lot=sig.get("lot",0),pips_r=sig.get("pr",0),
                     zh=sig.get("zh"),zl=sig.get("zl"),notes=sig.get("notes",""))
                 send_tg(sig_msg(sig))
-                _open_trades.append({"id":sid,"pair":sig["pair"],
-                    "strategy":sig["strategy"],"sig":sig["sig"],
-                    "entry":sig["entry"],"sl":sig["sl"],"tp":sig["tp"],
-                    "asset":_asset})
+                _open_trades.append({
+                    "id":       sid,
+                    "pair":     sig["pair"],
+                    "strategy": sig["strategy"],
+                    "sig":      sig["sig"],
+                    "entry":    sig["entry"],
+                    "sl":       sig["sl"],
+                    "tp":       sig["tp"],
+                    "asset":    _asset,
+                    "entry_ts": time.time(),  # untuk timeout check
+                    "filled":   False,         # belum kena entry
+                })
                 log.info(f"  [{code}] {_name} {sig['sig']} sent ID:{sid}")
 
         send_sig(s1_entry(name, pdata["z1"], df5, df1), "S1")
