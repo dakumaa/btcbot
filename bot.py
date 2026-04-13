@@ -221,27 +221,43 @@ def fetch_twelve_batch(symbols: list, interval: str, limit: int = 80) -> dict:
             }, timeout=20); r.raise_for_status()
             d = r.json()
 
-            # Cek rate limit
-            if isinstance(d, dict) and ("You have run" in str(d.get("message",""))):
-                log.warning(f"  Rate limit Twelve Data — tunggu 65 detik...")
+            # Validasi: response harus dict
+            if not isinstance(d, dict):
+                log.warning(f"  Twelve Data response bukan dict: {type(d).__name__}")
+                time.sleep(8); continue
+
+            # Cek rate limit atau error global
+            msg_global = str(d.get("message", ""))
+            if "You have run" in msg_global or d.get("status") == "error":
+                log.warning(f"  Rate limit/error Twelve Data: {msg_global[:80]} — tunggu 65 detik...")
                 time.sleep(65); continue
 
             result = {}
 
-            # Jika hanya 1 symbol, response langsung berupa dict dengan "values"
-            # Jika multi-symbol, response berupa {sym: {values: [...]}}
+            # Twelve Data response format:
+            # 1 symbol  → {"values": [...], "meta": {...}}
+            # N symbols → {"EUR/USD": {"values": [...], "meta": {...}}, "GBP/USD": {...}, ...}
             if len(symbols) == 1:
                 sym = symbols[0]
                 if "values" in d:
-                    result[sym] = _parse_twelve_df(d)
+                    parsed = _parse_twelve_df(d)
+                    if parsed is not None:
+                        result[sym] = parsed
+                else:
+                    log.warning(f"  Twelve {sym} {interval}: {d.get('message','no values')}")
             else:
                 for sym in symbols:
-                    sym_data = d.get(sym, {})
+                    sym_data = d.get(sym)
+                    # sym_data bisa: dict dengan values, dict dengan error, None, atau int
+                    if not isinstance(sym_data, dict):
+                        log.warning(f"  Twelve {sym}: response tidak valid (type={type(sym_data).__name__})")
+                        continue
                     if "values" in sym_data:
-                        result[sym] = _parse_twelve_df(sym_data)
+                        parsed = _parse_twelve_df(sym_data)
+                        if parsed is not None:
+                            result[sym] = parsed
                     else:
-                        msg = sym_data.get("message","no data") if isinstance(sym_data,dict) else "no data"
-                        log.warning(f"  Twelve Data {sym} {interval}: {msg}")
+                        log.warning(f"  Twelve {sym} {interval}: {sym_data.get('message','no values')}")
 
             return result
 
@@ -251,13 +267,52 @@ def fetch_twelve_batch(symbols: list, interval: str, limit: int = 80) -> dict:
     return {}
 
 def _parse_twelve_df(data: dict) -> pd.DataFrame | None:
-    """Parse response Twelve Data menjadi DataFrame."""
+    """
+    Parse response Twelve Data menjadi DataFrame.
+    Handle berbagai format response yang mungkin dikembalikan API.
+    """
     try:
-        df = pd.DataFrame(data["values"]).rename(columns={"datetime":"timestamp"})
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
+        # Validasi: data harus dict dan punya key "values"
+        if not isinstance(data, dict):
+            log.warning(f"  Parse error: data bukan dict (type={type(data).__name__})")
+            return None
+
+        values = data.get("values")
+
+        # Validasi: values harus list of dict, bukan int/string/None
+        if not isinstance(values, list):
+            msg = data.get("message", data.get("status", str(values)[:80]))
+            log.warning(f"  Twelve Data: values bukan list — {msg}")
+            return None
+
+        if len(values) < 2:
+            log.warning(f"  Twelve Data: data terlalu sedikit ({len(values)} candle)")
+            return None
+
+        # Validasi: setiap row harus dict
+        if not isinstance(values[0], dict):
+            log.warning(f"  Parse error: row bukan dict (type={type(values[0]).__name__})")
+            return None
+
+        df = pd.DataFrame(values).rename(columns={"datetime": "timestamp"})
+
+        if "timestamp" not in df.columns:
+            log.warning("  Parse error: kolom timestamp tidak ada")
+            return None
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            else:
+                df[c] = 0.0
+
+        df = df.dropna(subset=["timestamp"])
         df = df.sort_values("timestamp").reset_index(drop=True)
+
+        if len(df) < 2:
+            return None
+
         return df.iloc[:-1]  # buang candle live
     except Exception as e:
         log.warning(f"  Parse Twelve Data error: {e}")
