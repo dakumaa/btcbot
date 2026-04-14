@@ -52,7 +52,16 @@ MA_FAST = 9;     MA_SLOW  = 21; STRONG_LEG_MULT = 1.5
 VOLUME_LOOKBACK = 20
 
 # Bot config
-SCAN_INTERVAL_SEC = 900; DAILY_REPORT_HOUR = 0  # 15 menit = 96 scan/hari
+SCAN_INTERVAL_SEC  = 900   # scan tiap 15 menit saat aktif
+DAILY_REPORT_HOUR  = 0     # 00:00 UTC = 07:00 WIB
+
+# ── Sesi trading aktif (WIB = UTC+7) ──────────────────────────────────────────
+# London: 13:00–22:00 WIB = 06:00–15:00 UTC
+# New York: 20:00–03:00 WIB = 13:00–20:00 UTC
+# Gabungan aktif: 13:00–03:00 WIB = 06:00–20:00 UTC
+# Tidur (Sesi Asia): 03:00–13:00 WIB = 20:00–06:00 UTC
+SESSION_START_UTC  = 6     # 06:00 UTC = 13:00 WIB (London buka)
+SESSION_END_UTC    = 20    # 20:00 UTC = 03:00 WIB (NY tutup)
 SIGNAL_COOLDOWN_H = 2; DB_PATH = "signals.db"; LOG_FILE = "bot.log"
 MAX_RETRIES = 3
 
@@ -1024,17 +1033,45 @@ def scan():
 # DAILY REPORT
 # ============================================================
 _last_rpt=""
+def is_trading_session() -> bool:
+    """
+    Cek apakah sekarang dalam sesi London atau US (WIB).
+    Aktif  : 13:00–03:00 WIB = 06:00–20:00 UTC
+    Istirahat: 03:00–13:00 WIB = 20:00–06:00 UTC (Sesi Asia)
+    """
+    now_utc = datetime.now(tz=timezone.utc)
+    return SESSION_START_UTC <= now_utc.hour < SESSION_END_UTC
+
 def check_report():
+    """
+    Kirim daily report tepat jam 07:00 WIB (00:00 UTC).
+    Report berisi P&L, WR, streak, dan drawdown hari sebelumnya.
+    """
     global _last_rpt
-    now=datetime.now(tz=timezone.utc); yd=(now-timedelta(days=1)).strftime("%Y-%m-%d")
-    if now.hour==DAILY_REPORT_HOUR and now.minute<6 and _last_rpt!=yd:
-        stats=get_daily_stats(yd)
-        msg=daily_msg(yd,stats) if stats else f"📊 Daily Report {yd}: tidak ada trade."
-        send_tg(msg); log.info(f"Daily report {yd} sent."); _last_rpt=yd
+    now_utc = datetime.now(tz=timezone.utc)
+    now_wib = now_utc + timedelta(hours=7)
+    today   = now_wib.strftime("%Y-%m-%d")
+    yd_utc  = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Kirim tepat jam 07:00–07:05 WIB (00:00–00:05 UTC)
+    if now_utc.hour == DAILY_REPORT_HOUR and now_utc.minute < 6 and _last_rpt != today:
+        stats = get_daily_stats(yd_utc)
+        if stats:
+            msg = daily_msg(yd_utc, stats)
+        else:
+            msg = (f"📊 <b>DAILY REPORT — {now_wib.strftime('%Y-%m-%d')} (07:00 WIB)</b>\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                   f"Tidak ada trade closed kemarin.\n"
+                   f"🏦 Saldo est: ${ACCOUNT_BALANCE}")
+        send_tg(msg)
+        log.info(f"Daily report dikirim ({yd_utc}).")
+        _last_rpt = today
 
 # ============================================================
 # ENTRY POINT
 # ============================================================
+_session_notified = False  # flag notif pergantian sesi
+
 def run():
     log.info("Forex Signal Bot START")
     log.info(f"Pairs: {', '.join(a['name'] for a in ASSETS)}")
@@ -1050,12 +1087,50 @@ def run():
             f"💸 Risk: ${RISK_PER_TRADE_USD}/trade | Saldo: ${ACCOUNT_BALANCE}\n"
             "📦 Signal = LIMIT ORDER, bukan market order.\n"
             "⚠️ Bukan rekomendasi finansial.")
-    try: scan()
-    except Exception as e: log.error(f"First scan error: {e}", exc_info=True)
+    # Scan pertama hanya jika dalam sesi aktif
+    if is_trading_session():
+        try: scan()
+        except Exception as e: log.error(f"First scan error: {e}", exc_info=True)
+    else:
+        now_wib = datetime.now(tz=timezone.utc) + timedelta(hours=7)
+        log.info(f"Bot aktif tapi sekarang sesi Asia ({now_wib.strftime('%H:%M')} WIB) — menunggu London 13:00 WIB")
+        send_tg(f"😴 <b>Bot Standby — Sesi Asia</b>\n"
+                f"⏰ Sekarang: {now_wib.strftime('%H:%M')} WIB\n"
+                f"🟢 Aktif kembali: 13:00 WIB (London)\n"
+                f"💤 Tidak scan saat sesi Asia untuk hemat API credit.")
+
     while True:
         try:
             time.sleep(SCAN_INTERVAL_SEC)
-            check_report(); scan()
+            check_report()
+
+            now_wib = datetime.now(tz=timezone.utc) + timedelta(hours=7)
+            in_session = is_trading_session()
+
+            if in_session:
+                if not _session_notified:
+                    log.info(f"🟢 Sesi aktif ({now_wib.strftime('%H:%M')} WIB) — mulai scan")
+                    send_tg(f"🟢 <b>Sesi Aktif</b>\n"
+                            f"⏰ {now_wib.strftime('%H:%M')} WIB\n"
+                            f"📊 London/NY — bot mulai scan signal.")
+                    _session_notified = True
+                scan()
+            else:
+                if _session_notified:
+                    log.info(f"😴 Sesi Asia ({now_wib.strftime('%H:%M')} WIB) — bot istirahat")
+                    send_tg(f"😴 <b>Sesi Asia — Bot Istirahat</b>\n"
+                            f"⏰ {now_wib.strftime('%H:%M')} WIB\n"
+                            f"💤 Aktif kembali 13:00 WIB.\n"
+                            f"💡 Hemat API credit Twelve Data.")
+                    _session_notified = False
+                else:
+                    log.debug(f"Sesi Asia ({now_wib.strftime('%H:%M')} WIB) — skip scan")
+
+                # Cek open trade meski di luar sesi (lindungi posisi aktif)
+                if _open_trades:
+                    log.info(f"  Ada {len(_open_trades)} open trade — monitor tetap jalan")
+                    monitor()
+
         except KeyboardInterrupt: log.info("Bot stopped."); break
         except Exception as e: log.error(f"Error: {e}", exc_info=True); time.sleep(30)
 
