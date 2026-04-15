@@ -1101,6 +1101,7 @@ def run():
 
     while True:
         try:
+            global _session_notified
             time.sleep(SCAN_INTERVAL_SEC)
             check_report()
 
