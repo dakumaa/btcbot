@@ -52,16 +52,20 @@ MA_FAST = 9;     MA_SLOW  = 21; STRONG_LEG_MULT = 1.5
 VOLUME_LOOKBACK = 20
 
 # Bot config
-SCAN_INTERVAL_SEC  = 900   # scan tiap 15 menit saat aktif
 DAILY_REPORT_HOUR  = 0     # 00:00 UTC = 07:00 WIB
 
 # ── Sesi trading aktif (WIB = UTC+7) ──────────────────────────────────────────
-# London: 13:00–22:00 WIB = 06:00–15:00 UTC
-# New York: 20:00–03:00 WIB = 13:00–20:00 UTC
-# Gabungan aktif: 13:00–03:00 WIB = 06:00–20:00 UTC
-# Tidur (Sesi Asia): 03:00–13:00 WIB = 20:00–06:00 UTC
 SESSION_START_UTC  = 6     # 06:00 UTC = 13:00 WIB (London buka)
 SESSION_END_UTC    = 20    # 20:00 UTC = 03:00 WIB (NY tutup)
+
+# ── Adaptive Polling intervals ────────────────────────────────────────────────
+# IDLE    : tidak ada zona di TF30         → scan tiap 15 menit
+# ALERT   : ada zona, jarak harga > 15 pip → scan tiap 5 menit
+# MONITOR : harga < 15 pip dari zona       → scan tiap 1 menit
+INTERVAL_IDLE    = 900   # 15 menit
+INTERVAL_ALERT   = 300   # 5 menit
+INTERVAL_MONITOR = 60    # 1 menit
+MONITOR_PIPS     = 15    # jarak < 15 pip → mode MONITOR
 SIGNAL_COOLDOWN_H = 2; DB_PATH = "signals.db"; LOG_FILE = "bot.log"
 MAX_RETRIES = 3
 
@@ -670,41 +674,54 @@ def send_tg(msg):
 # MESSAGES
 # ============================================================
 def sig_msg(sig):
-    now=datetime.now(tz=timezone.utc)
-    wib=(now+timedelta(hours=7)).strftime("%H:%M WIB")
-    utc=now.strftime("%Y-%m-%d %H:%M UTC")
-    pair=sig["pair"]; s=sig["sig"]
-    arrow="🔼 BUY" if s=="BUY" else "🔽 SELL"
-    pr=sig.get("pr",0); pt=pr*RR_RATIO
-    lot=sig.get("lot",0.01); en=sig.get("en",1)
-    etag=f" [Entry {en}/2]" if en>1 else ""
-    zinfo=f"📦 Zone: ${sig.get('zl',0):.5f} – ${sig.get('zh',0):.5f}\n"
-    if sig.get("ob_h"): zinfo+=f"📦 OB  : ${sig.get('ob_l',0):.5f} – ${sig.get('ob_h',0):.5f}\n"
-    if sig.get("patt"): zinfo+=f"📋 Pola: {sig['patt']}\n"
-    if sig.get("trend"): zinfo+=f"📈 Tren: {sig['trend']}\n"
-    return (f"🚨 <b>[{sig['strategy']}]{etag}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💱 Pair     : <b>{pair}</b>\n"
-            f"📌 Signal   : <b>{arrow}</b>\n"
-            f"⏰ Waktu    : {utc} / {wib}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 <b>SETUP ENTRY (Limit Order)</b>\n"
-            f"💰 Entry    : <b>${sig['entry']:.5f}</b>\n"
-            f"🛑 Stop Loss: <b>${sig['sl']:.5f}</b> ({pr:.1f} pips)\n"
-            f"🎯 Take Profit: <b>${sig['tp']:.5f}</b> ({pt:.1f} pips)\n"
-            f"📐 RR       : 1:{RR_RATIO}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{zinfo}"
-            f"📐 Spread   : +{SPREAD_PIPS} pips (sudah dalam entry & SL)\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏦 Lot      : <b>{lot:.2f} lot cent</b>\n"
-            f"💸 Risk     : ~${RISK_PER_TRADE_USD:.0f} ({RISK_PER_TRADE_USD/ACCOUNT_BALANCE*100:.1f}%)\n"
-            f"💵 Profit TP: ~${RISK_PER_TRADE_USD*RR_RATIO:.0f}\n"
-            f"🔍 Confirm  : {sig['tf_confirm']}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <i>Pasang LIMIT ORDER di harga entry.\n"
-            f"Bukan market order — hindari telat entry.\n"
-            f"Bukan rekomendasi finansial.</i>")
+    """
+    Format pesan signal sesuai spesifikasi:
+    [PAIR] - [STRATEGY]
+    Type: BUY/SELL LIMIT
+    Entry / SL / TP / Lot
+    Note: Harga mendekati zona, pasang order sekarang!
+    """
+    now   = datetime.now(tz=timezone.utc)
+    wib   = (now + timedelta(hours=7)).strftime("%H:%M WIB")
+    utc   = now.strftime("%Y-%m-%d %H:%M UTC")
+    pair  = sig["pair"]
+    s     = sig["sig"]
+    pr    = sig.get("pr", 0)
+    pt    = pr * RR_RATIO
+    lot   = sig.get("lot", 0.01)
+    en    = sig.get("en", 1)
+    strat = sig["strategy"].split("-")[0]  # S1/S2/S3
+    mode  = sig.get("mode", "ALERT")
+
+    # Zone info ringkas
+    zh = sig.get("zh", 0); zl = sig.get("zl", 0)
+    patt = sig.get("patt", "")
+    trend = sig.get("trend", "")
+
+    # Mode icon
+    mode_icon = {"MONITOR": "🔴", "ALERT": "🟡", "IDLE": "🟢"}.get(mode, "🟡")
+
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>{pair} — {strat}</b> {mode_icon}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Type  : <b>{'BUY' if s=='BUY' else 'SELL'} LIMIT</b>\n"
+        f"Entry : <b>${sig['entry']:.5f}</b>\n"
+        f"SL    : <b>${sig['sl']:.5f}</b> ({pr:.1f} pips)\n"
+        f"TP    : <b>${sig['tp']:.5f}</b> ({pt:.1f} pips)\n"
+        f"Lot   : <b>{lot:.2f} lot cent</b>\n"
+        f"RR    : 1:{RR_RATIO} | Risk: ~${RISK_PER_TRADE_USD:.0f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Zone  : ${zl:.5f} – ${zh:.5f}\n"
+        + (f"Pola  : {patt}\n" if patt else "")
+        + (f"Tren  : {trend}\n" if trend else "")
+        + f"Spread: +{SPREAD_PIPS} pips (sudah dalam entry & SL)\n"
+        f"Waktu : {utc} / {wib}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>Note: Harga mendekati zona, pasang order sekarang!</b>\n"
+        f"<i>Limit order di harga entry — bukan market order.</i>"
+        + (f"\n<i>[Entry {en}/2]</i>" if en > 1 else "")
+    )
 
 def result_msg(trade, result, price):
     pnl=RISK_PER_TRADE_USD*RR_RATIO if result=="TP" else -RISK_PER_TRADE_USD
@@ -869,13 +886,95 @@ def can_send(pair,code):
 # ============================================================
 # MAIN SCAN
 # ============================================================
+
+# ============================================================
+# ADAPTIVE POLLING ENGINE
+# ============================================================
+_current_mode   = "IDLE"   # IDLE | ALERT | MONITOR
+_mode_pair      = ""        # pair yang trigger mode
+
+def get_zone_distance_pips(pair: str, price: float, zones: list) -> float:
+    """
+    Hitung jarak harga ke zona terdekat dalam pips.
+    Kembalikan 0 jika harga sudah di dalam zona.
+    """
+    if not zones:
+        return float("inf")
+    min_dist = float("inf")
+    for z in zones:
+        zh = z.get("zh", z.get("zone_high", 0))
+        zl = z.get("zl", z.get("zone_low", 0))
+        if zl <= price <= zh:
+            return 0.0  # di dalam zona
+        dist_to_top = abs(price - zh)
+        dist_to_bot = abs(price - zl)
+        dist = min(dist_to_top, dist_to_bot)
+        pips_dist = dist / pip(pair)
+        min_dist = min(min_dist, pips_dist)
+    return min_dist
+
+def determine_mode(pair_zones: list) -> tuple[str, str, float]:
+    """
+    Tentukan mode polling berdasarkan semua pair dan zona.
+    Returns: (mode, pair_paling_dekat, jarak_pips)
+    mode: "IDLE" | "ALERT" | "MONITOR"
+    """
+    closest_pair  = ""
+    closest_dist  = float("inf")
+    has_any_zone  = False
+
+    for pdata in pair_zones:
+        name   = pdata["asset"]["name"]
+        price  = _price_cache.get(name, 0)
+        if price == 0:
+            continue
+
+        all_zones = pdata.get("z1", []) + pdata.get("z2", []) + pdata.get("z3", [])
+        if not all_zones:
+            continue
+
+        has_any_zone = True
+        dist = get_zone_distance_pips(name, price, all_zones)
+
+        if dist < closest_dist:
+            closest_dist = dist
+            closest_pair = name
+
+    if not has_any_zone:
+        return "IDLE", "", float("inf")
+    if closest_dist < MONITOR_PIPS:
+        return "MONITOR", closest_pair, closest_dist
+    return "ALERT", closest_pair, closest_dist
+
+def get_interval(mode: str) -> int:
+    return {"MONITOR": INTERVAL_MONITOR, "ALERT": INTERVAL_ALERT}.get(mode, INTERVAL_IDLE)
+
+def mode_changed_msg(old_mode: str, new_mode: str, pair: str, dist: float) -> str:
+    icons = {"IDLE": "😴", "ALERT": "🟡", "MONITOR": "🔴"}
+    labels = {"IDLE": "IDLE (15 menit)", "ALERT": "ALERT (5 menit)", "MONITOR": "MONITOR (1 menit)"}
+    msg = (f"{icons.get(new_mode,'📊')} <b>Mode: {labels.get(new_mode, new_mode)}</b>\n"
+           f"━━━━━━━━━━━━━━━━━━━━━━\n")
+    if new_mode == "IDLE":
+        msg += "Tidak ada zona aktif. Bot scan tiap 15 menit."
+    elif new_mode == "ALERT":
+        msg += (f"Ada zona di TF30.\n"
+                f"💱 Pair terdekat: {pair}\n"
+                f"📏 Jarak: {dist:.1f} pips dari zona\n"
+                f"🔄 Scan tiap 5 menit.")
+    elif new_mode == "MONITOR":
+        msg += (f"🔥 HARGA DEKAT ZONA!\n"
+                f"💱 {pair} — jarak {dist:.1f} pips\n"
+                f"⚡ Scan tiap 1 menit. Siap pasang order!")
+    return msg
+
 def has_active_trade(pair: str) -> bool:
     """Cek apakah pair ini masih punya open trade."""
     return any(t["pair"] == pair for t in _open_trades)
 
-def scan():
+def scan() -> list:
     """
-    SCAN 2-FASE untuk hemat API credit Twelve Data:
+    SCAN 2-FASE dengan Adaptive Polling.
+    Returns: list of pair_zones (dipakai determine_mode untuk interval berikutnya)
 
     FASE 1 — TF30 screening (1 request batch untuk semua pair):
       Fetch hanya TF30. Deteksi zona potensial (imbalance/S&D/pullback).
@@ -1016,8 +1115,8 @@ def scan():
                     "sl":       sig["sl"],
                     "tp":       sig["tp"],
                     "asset":    _asset,
-                    "entry_ts": time.time(),  # untuk timeout check
-                    "filled":   False,         # belum kena entry
+                    "entry_ts": time.time(),
+                    "filled":   False,
                 })
                 log.info(f"  [{code}] {_name} {sig['sig']} sent ID:{sid}")
 
@@ -1028,6 +1127,7 @@ def scan():
     # Monitor open trade (pakai price cache, tidak request baru)
     monitor()
     log.info("=== SCAN SELESAI ===")
+    return pairs_with_zones  # dipakai determine_mode()
 
 # ============================================================
 # DAILY REPORT
@@ -1087,52 +1187,80 @@ def run():
             f"💸 Risk: ${RISK_PER_TRADE_USD}/trade | Saldo: ${ACCOUNT_BALANCE}\n"
             "📦 Signal = LIMIT ORDER, bukan market order.\n"
             "⚠️ Bukan rekomendasi finansial.")
-    # Scan pertama hanya jika dalam sesi aktif
-    if is_trading_session():
-        try: scan()
-        except Exception as e: log.error(f"First scan error: {e}", exc_info=True)
-    else:
-        now_wib = datetime.now(tz=timezone.utc) + timedelta(hours=7)
-        log.info(f"Bot aktif tapi sekarang sesi Asia ({now_wib.strftime('%H:%M')} WIB) — menunggu London 13:00 WIB")
-        send_tg(f"😴 <b>Bot Standby — Sesi Asia</b>\n"
-                f"⏰ Sekarang: {now_wib.strftime('%H:%M')} WIB\n"
-                f"🟢 Aktif kembali: 13:00 WIB (London)\n"
-                f"💤 Tidak scan saat sesi Asia untuk hemat API credit.")
+    global _current_mode, _mode_pair, _session_notified
 
+    # ── Scan pertama ──────────────────────────────────────────────────────────
+    now_wib = datetime.now(tz=timezone.utc) + timedelta(hours=7)
+    if is_trading_session():
+        try:
+            pair_zones = scan()
+            _current_mode, _mode_pair, dist = determine_mode(pair_zones)
+            interval = get_interval(_current_mode)
+            log.info(f"Mode awal: {_current_mode} | interval: {interval}s")
+        except Exception as e:
+            log.error(f"First scan error: {e}", exc_info=True)
+            interval = INTERVAL_IDLE
+    else:
+        log.info(f"Bot standby — sesi Asia ({now_wib.strftime('%H:%M')} WIB)")
+        send_tg(f"😴 <b>Bot Standby — Sesi Asia</b>\n"
+                f"⏰ {now_wib.strftime('%H:%M')} WIB\n"
+                f"🟢 Aktif kembali: 13:00 WIB (London)\n"
+                f"💤 Hemat API credit Twelve Data.")
+        interval = INTERVAL_IDLE
+
+    _session_notified = False
+
+    # ── Main loop dengan adaptive interval ───────────────────────────────────
     while True:
         try:
-            global _session_notified
-            time.sleep(SCAN_INTERVAL_SEC)
+            log.debug(f"Tidur {interval}s (mode={_current_mode})")
+            time.sleep(interval)
             check_report()
 
-            now_wib = datetime.now(tz=timezone.utc) + timedelta(hours=7)
+            now_wib    = datetime.now(tz=timezone.utc) + timedelta(hours=7)
             in_session = is_trading_session()
 
-            if in_session:
-                if not _session_notified:
-                    log.info(f"🟢 Sesi aktif ({now_wib.strftime('%H:%M')} WIB) — mulai scan")
-                    send_tg(f"🟢 <b>Sesi Aktif</b>\n"
-                            f"⏰ {now_wib.strftime('%H:%M')} WIB\n"
-                            f"📊 London/NY — bot mulai scan signal.")
-                    _session_notified = True
-                scan()
-            else:
+            # ── Sesi Asia: istirahat (kecuali ada open trade) ─────────────────
+            if not in_session:
                 if _session_notified:
-                    log.info(f"😴 Sesi Asia ({now_wib.strftime('%H:%M')} WIB) — bot istirahat")
+                    log.info(f"😴 Sesi Asia ({now_wib.strftime('%H:%M')} WIB)")
                     send_tg(f"😴 <b>Sesi Asia — Bot Istirahat</b>\n"
                             f"⏰ {now_wib.strftime('%H:%M')} WIB\n"
-                            f"💤 Aktif kembali 13:00 WIB.\n"
-                            f"💡 Hemat API credit Twelve Data.")
+                            f"💤 Aktif kembali 13:00 WIB.")
                     _session_notified = False
-                else:
-                    log.debug(f"Sesi Asia ({now_wib.strftime('%H:%M')} WIB) — skip scan")
-
-                # Cek open trade meski di luar sesi (lindungi posisi aktif)
+                    _current_mode = "IDLE"
                 if _open_trades:
-                    log.info(f"  Ada {len(_open_trades)} open trade — monitor tetap jalan")
                     monitor()
+                interval = INTERVAL_IDLE
+                continue
 
-        except KeyboardInterrupt: log.info("Bot stopped."); break
-        except Exception as e: log.error(f"Error: {e}", exc_info=True); time.sleep(30)
+            # ── Sesi London/NY aktif ──────────────────────────────────────────
+            if not _session_notified:
+                log.info(f"🟢 Sesi aktif ({now_wib.strftime('%H:%M')} WIB)")
+                send_tg(f"🟢 <b>Sesi Aktif — London/NY</b>\n"
+                        f"⏰ {now_wib.strftime('%H:%M')} WIB\n"
+                        f"📊 Bot mulai scan. Mode: {_current_mode}")
+                _session_notified = True
+
+            # ── Scan & tentukan mode berikutnya ───────────────────────────────
+            pair_zones = scan()
+            new_mode, new_pair, new_dist = determine_mode(pair_zones)
+            new_interval = get_interval(new_mode)
+
+            # Kirim notif jika mode berubah
+            if new_mode != _current_mode:
+                log.info(f"Mode: {_current_mode} → {new_mode} ({new_pair} {new_dist:.1f}p)")
+                send_tg(mode_changed_msg(_current_mode, new_mode, new_pair, new_dist))
+                _current_mode = new_mode
+                _mode_pair    = new_pair
+
+            interval = new_interval
+            log.info(f"Next scan dalam {interval}s (mode={_current_mode})")
+
+        except KeyboardInterrupt:
+            log.info("Bot stopped."); break
+        except Exception as e:
+            log.error(f"Error: {e}", exc_info=True)
+            time.sleep(60)
 
 if __name__=="__main__": run()
