@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================
 # FOREX SIGNAL BOT — 3 Strategi Scalping Akun Cent $300
-# Pair     : EURUSD, GBPUSD, USDJPY, XAUUSD, BTCUSD
+# Pair     : EURUSD, XAUUSD, BTCUSD
 # Strategi : S1 Imbalance+Fractal+EMA | S2 S&D RBR/DBR | S3 Pullback+OB+PA
 # Data     : Twelve Data API (Forex/Gold) + Binance Vision (BTC)
 # Risk     : $20/trade (6.5%), RR 1:2.5, spread 3 pips fixed
@@ -48,7 +48,7 @@ TF_H_BN = "30m";   TF_M_BN = "5m";  TF_L_BN = "1m"   # Binance
 
 # Indicators
 ATR_PERIOD = 14; EMA_FAST = 21; EMA_SLOW = 50
-MA_FAST = 9;     MA_SLOW  = 21; STRONG_LEG_MULT = 1.5
+MA_FAST = 9;     MA_SLOW  = 21; STRONG_LEG_MULT = 1.2  # diturunkan 1.5→1.2 agar lebih sering detect
 VOLUME_LOOKBACK = 20
 
 # Bot config
@@ -85,8 +85,10 @@ TWELVE_REQ_DELAY  = 10.0  # detik antar request, safety margin
 _last_twelve_req  = 0.0
 
 # Pip sizes
-PIP_SIZE = {"EURUSD":0.0001,"GBPUSD":0.0001,"USDJPY":0.01,
-            "XAUUSD":0.01,"BTCUSD":1.00}
+# EURUSD: pip = 0.0001 (4 decimal)
+# XAUUSD: pip = 0.01 (harga ~3300, bergerak dalam cents, pip = $0.01)
+# BTCUSD: pip = 1.00 ($1 move)
+PIP_SIZE = {"EURUSD":0.0001,"XAUUSD":0.01,"BTCUSD":1.00}
 
 # ── Lot value per pip untuk akun CENT ────────────────────────────────────────
 # Akun cent: 1 lot cent = 0.01 lot standard = 1,000 unit
@@ -104,20 +106,20 @@ PIP_SIZE = {"EURUSD":0.0001,"GBPUSD":0.0001,"USDJPY":0.01,
 #   Lot = $20 / (10pips × $0.07) = 28.6 lot cent
 #
 # SAFETY CAP: MAX_LOT memastikan lot tidak absurd
-LOT_VALUE_PER_PIP = {"EURUSD":0.10,"GBPUSD":0.10,"USDJPY":0.07,
-                     "XAUUSD":0.10,"BTCUSD":0.10}
+# Nilai per pip per 0.01 lot cent:
+# EURUSD: 0.01 lot cent = 1000 unit → $0.10/pip
+# XAUUSD: 0.01 lot cent = 1000 unit → pip=$0.01 → val=$0.10
+# BTCUSD: 0.01 lot cent → $0.10 per $1 move (approx)
+LOT_VALUE_PER_PIP = {"EURUSD":0.10,"XAUUSD":0.10,"BTCUSD":0.10}
 
 # Batas maksimum lot per trade — WAJIB ada untuk safety
 # Sesuaikan dengan margin yang tersedia di akun $300 cent
-MAX_LOT = {"EURUSD":10.0,"GBPUSD":10.0,"USDJPY":10.0,
-           "XAUUSD": 5.0,"BTCUSD": 2.0}
+MAX_LOT = {"EURUSD":10.0,"XAUUSD":5.0,"BTCUSD":2.0}
 
 ASSETS = [
-    {"name":"EURUSD","source":"twelve","sym_td":"EUR/USD","sym_bn":None},
-    {"name":"GBPUSD","source":"twelve","sym_td":"GBP/USD","sym_bn":None},
-    {"name":"USDJPY","source":"twelve","sym_td":"USD/JPY","sym_bn":None},
-    {"name":"XAUUSD","source":"twelve","sym_td":"XAU/USD","sym_bn":None},
-    {"name":"BTCUSD","source":"binance","sym_td":None,"sym_bn":"BTCUSDT"},
+    {"name":"EURUSD","source":"twelve", "sym_td":"EUR/USD","sym_bn":None},
+    {"name":"XAUUSD","source":"twelve", "sym_td":"XAU/USD","sym_bn":None},
+    {"name":"BTCUSD","source":"binance","sym_td":None,     "sym_bn":"BTCUSDT"},
 ]
 
 # ============================================================
@@ -480,23 +482,27 @@ def s1_zones(df30, pair):
         if pd.isna(av) or av<=0: continue
         c1,c2,c3=df30.iloc[i-2],df30.iloc[i-1],df30.iloc[i]
         up=e21.iloc[i]>e50.iloc[i]; dn=e21.iloc[i]<e50.iloc[i]
-        # Bullish imbalance
+        # Bullish imbalance (FVG atau partial gap ≤20% ATR masih valid)
+        # Gap murni: c2.low > c1.high → sangat bagus
+        # Partial: c2.low sedikit lebih rendah dari c1.high masih ok (overlap kecil)
+        bull_gap = c2["low"] >= c1["high"] - av * 0.20  # toleransi 20% ATR
         if (up and c1["close"]<c1["open"] and c3["close"]>c3["open"]
-                and c2["low"]>c1["high"]
+                and bull_gap
                 and (c3["high"]-c1["low"])>=STRONG_LEG_MULT*av):
             fp=next((df30["low"].iloc[j] for j in range(i-1,max(0,i-20),-1)
                      if fr["fl"].iloc[j]),None)
             il,ih=c1["high"],c2["high"]
-            if all(df30["low"].iloc[j]>il for j in range(i+1,len(df30))):
+            # Fresh: harga tidak masuk >50% zona (lebih realistis)
+            if all(df30["low"].iloc[j]>il-av*0.5 for j in range(i+1,len(df30))):
                 zones.append({"type":"BULL","sig":"BUY","zh":ih,"zl":il,"fp":fp,"av":av,"i":i,"trend":"UPTREND"})
-        # Bearish imbalance
+        # Bearish imbalance (toleransi overlap kecil)
         elif (dn and c1["close"]>c1["open"] and c3["close"]<c3["open"]
-                and c2["high"]<c1["low"]
+                and c2["high"] <= c1["low"] + av * 0.20
                 and (c1["high"]-c3["low"])>=STRONG_LEG_MULT*av):
             fp=next((df30["high"].iloc[j] for j in range(i-1,max(0,i-20),-1)
                      if fr["fh"].iloc[j]),None)
             ih,il=c1["low"],c2["low"]
-            if all(df30["high"].iloc[j]<ih for j in range(i+1,len(df30))):
+            if all(df30["high"].iloc[j]<ih+av*0.5 for j in range(i+1,len(df30))):
                 zones.append({"type":"BEAR","sig":"SELL","zh":ih,"zl":il,"fp":fp,"av":av,"i":i,"trend":"DOWNTREND"})
     return zones[-5:]
 
@@ -888,6 +894,222 @@ def can_send(pair,code):
 # ============================================================
 
 # ============================================================
+# STRATEGI 4 — MOMENTUM CANDLE + FIBONACCI EQUILIBRIUM (TF30)
+# ============================================================
+# Konsep:
+# 1. Deteksi momentum candle di TF30: candle dengan body besar
+#    (≥ 60% range) dan volume tinggi = sinyal momentum kuat
+# 2. Hitung Fibonacci retracement dari swing yang memicu candle
+# 3. Entry di area EQUILIBRIUM (38.2%–61.8% retracement)
+#    Equilibrium = zona nilai tengah, probabilitas continuation tinggi
+# 4. SL di luar Fibonacci 78.6% (invalidasi struktur)
+# 5. TP = RR 1:2.5 dari entry
+
+FIB_ENTRY_LOW  = 0.382  # 38.2% — batas bawah equilibrium
+FIB_ENTRY_HIGH = 0.618  # 61.8% — batas atas equilibrium
+FIB_SL_LEVEL   = 0.786  # 78.6% — level invalidasi
+MOMENTUM_BODY  = 0.60   # body ≥ 60% range = momentum candle
+MOMENTUM_VOL   = 1.5    # volume ≥ 1.5× rata-rata 20 candle
+
+def s4_zones(df30: "pd.DataFrame", pair: str) -> list:
+    """
+    Deteksi zona Fibonacci Equilibrium dari momentum candle TF30.
+
+    Langkah:
+    1. Scan tiap candle, cari yang punya:
+       - Body ≥ 60% dari high-low range
+       - Volume ≥ 1.5× rata-rata 20 candle (momentum kuat)
+       - Searah tren (MA9 > MA21 = bullish, sebaliknya bearish)
+    2. Dari candle momentum, hitung swing:
+       - Bullish: swing low = low 5 candle sebelumnya
+       - Bearish: swing high = high 5 candle sebelumnya
+    3. Fibonacci dari swing ke ujung candle momentum
+    4. Zona entry = 38.2%–61.8% (equilibrium)
+    5. SL reference = 78.6% level
+    """
+    if df30 is None or len(df30) < 25:
+        return []
+
+    ma9_s  = ma(df30, 9)
+    ma21_s = ma(df30, 21)
+    atr_s  = atr(df30, ATR_PERIOD)
+    zones  = []
+
+    for i in range(10, len(df30) - 1):
+        c   = df30.iloc[i]
+        av  = atr_s.iloc[i]
+        if pd.isna(av) or av <= 0:
+            continue
+
+        # ── Cek momentum candle ────────────────────────────────────────────────
+        rng  = c["high"] - c["low"]
+        if rng < av * 0.5:
+            continue  # candle terlalu kecil
+        body = abs(c["close"] - c["open"])
+        if body / rng < MOMENTUM_BODY:
+            continue  # bukan momentum candle
+
+        # Volume check
+        avg_vol = df30["volume"].iloc[max(0, i-20):i].mean()
+        if avg_vol > 0 and df30["volume"].iloc[i] < avg_vol * MOMENTUM_VOL:
+            continue
+
+        # Tren filter (MA9 vs MA21)
+        if pd.isna(ma9_s.iloc[i]) or pd.isna(ma21_s.iloc[i]):
+            continue
+        bullish_trend = ma9_s.iloc[i] > ma21_s.iloc[i]
+        bearish_trend = ma9_s.iloc[i] < ma21_s.iloc[i]
+
+        # ── BULLISH momentum candle ────────────────────────────────────────────
+        if bullish_trend and c["close"] > c["open"]:
+            # Swing low = lowest low dalam 5 candle sebelumnya
+            swing_low  = df30["low"].iloc[max(0, i-5):i].min()
+            swing_high = c["high"]  # ujung atas candle momentum
+
+            if swing_high <= swing_low:
+                continue
+
+            move = swing_high - swing_low
+            # Fibonacci levels
+            fib382 = swing_high - move * FIB_ENTRY_HIGH   # 61.8% dari atas
+            fib618 = swing_high - move * FIB_ENTRY_LOW    # 38.2% dari atas
+            fib786 = swing_high - move * FIB_SL_LEVEL
+            # Entry zone = equilibrium 38.2%–61.8%
+            zone_high = fib618  # harga lebih tinggi (38.2% retrace)
+            zone_low  = fib382  # harga lebih rendah (61.8% retrace)
+
+            # Fresh check: harga belum pernah masuk ke zona ini setelah candle
+            fresh = all(
+                df30["low"].iloc[j] > zone_low - av * 0.3
+                for j in range(i + 1, len(df30))
+            )
+            if not fresh:
+                continue
+
+            zones.append({
+                "type":       "FIB_BULL",
+                "sig":        "BUY",
+                "zh":         zone_high,
+                "zl":         zone_low,
+                "fib786":     fib786,      # SL reference
+                "swing_low":  swing_low,
+                "swing_high": swing_high,
+                "av":         av,
+                "i":          i,
+                "trend":      "UPTREND",
+                "momentum":   f"body {body/rng*100:.0f}% vol {df30['volume'].iloc[i]/avg_vol:.1f}x" if avg_vol > 0 else "momentum",
+            })
+
+        # ── BEARISH momentum candle ────────────────────────────────────────────
+        elif bearish_trend and c["close"] < c["open"]:
+            swing_high = df30["high"].iloc[max(0, i-5):i].max()
+            swing_low  = c["low"]
+
+            if swing_high <= swing_low:
+                continue
+
+            move = swing_high - swing_low
+            fib382 = swing_low + move * FIB_ENTRY_HIGH
+            fib618 = swing_low + move * FIB_ENTRY_LOW
+            fib786 = swing_low + move * FIB_SL_LEVEL
+            zone_low  = fib618
+            zone_high = fib382
+
+            fresh = all(
+                df30["high"].iloc[j] < zone_high + av * 0.3
+                for j in range(i + 1, len(df30))
+            )
+            if not fresh:
+                continue
+
+            zones.append({
+                "type":       "FIB_BEAR",
+                "sig":        "SELL",
+                "zh":         zone_high,
+                "zl":         zone_low,
+                "fib786":     fib786,
+                "swing_low":  swing_low,
+                "swing_high": swing_high,
+                "av":         av,
+                "i":          i,
+                "trend":      "DOWNTREND",
+                "momentum":   f"body {body/rng*100:.0f}% vol {df30['volume'].iloc[i]/avg_vol:.1f}x" if avg_vol > 0 else "momentum",
+            })
+
+    return zones[-5:]
+
+def s4_entry(pair: str, zones: list, df5: "pd.DataFrame", df1: "pd.DataFrame") -> dict | None:
+    """
+    Entry S4: harga pullback ke zona Fibonacci Equilibrium (38.2–61.8%).
+    SL: di luar Fibonacci 78.6% + buffer ATR TF5.
+    TP: RR 1:2.5.
+    """
+    if not zones or df5 is None or df1 is None:
+        return None
+
+    av5_s = atr(df5, ATR_PERIOD)
+    av5v  = float(av5_s.iloc[-1]) if not pd.isna(av5_s.iloc[-1]) else 0
+    p5    = df5["close"].iloc[-1]
+    v_ok  = vol_ok(df5)
+
+    for z in reversed(zones):
+        zh, zl = z["zh"], z["zl"]
+        buf = z["av"] * 0.15
+
+        # Cek harga masuk zona equilibrium
+        if not (zl - buf <= p5 <= zh + buf):
+            continue
+
+        # Konfirmasi TF5: ada rejection atau volume
+        l5   = df5.iloc[-1]
+        r5   = l5["high"] - l5["low"]
+        b5   = abs(l5["close"] - l5["open"])
+        wr5  = (r5 - b5) / r5 if r5 > 0 else 0
+        rej5 = (
+            (z["sig"] == "BUY"  and wr5 >= 0.4 and l5["close"] > l5["open"]) or
+            (z["sig"] == "SELL" and wr5 >= 0.4 and l5["close"] < l5["open"])
+        )
+        if not rej5 and not v_ok:
+            continue
+
+        if z["sig"] == "BUY":
+            # Entry di proximal line (batas atas zona = 38.2% retrace)
+            e      = e_buy(pair, zl)          # entry di batas bawah zona + spread
+            raw_sl = z["fib786"] - av5v       # SL di bawah 78.6%
+            s      = sl_buy_f(pair, raw_sl)
+            risk   = e - s
+        else:
+            e      = e_sell(pair, zh)
+            raw_sl = z["fib786"] + av5v
+            s      = sl_sell_f(pair, raw_sl)
+            risk   = s - e
+
+        if risk <= 0:
+            continue
+
+        t    = calc_tp(e, s)
+        pr   = price2p(pair, risk)
+        lot  = calc_lot(pair, pr)
+
+        return {
+            "strategy":  "S4-Momentum+Fibonacci",
+            "sig":       z["sig"],
+            "pair":      pair,
+            "entry":     e,
+            "sl":        s,
+            "tp":        t,
+            "lot":       lot,
+            "pr":        pr,
+            "zh":        zh,
+            "zl":        zl,
+            "trend":     z["trend"],
+            "tf_confirm": "TF30 Momentum+Fib38.2-61.8% / TF5 rejection / TF1 limit",
+            "notes":     f"Fib equil {zl:.5f}–{zh:.5f} | {z['momentum']} | SL@78.6%={z['fib786']:.5f}",
+        }
+    return None
+
+
+# ============================================================
 # ADAPTIVE POLLING ENGINE
 # ============================================================
 _current_mode   = "IDLE"   # IDLE | ALERT | MONITOR
@@ -929,7 +1151,7 @@ def determine_mode(pair_zones: list) -> tuple[str, str, float]:
         if price == 0:
             continue
 
-        all_zones = pdata.get("z1", []) + pdata.get("z2", []) + pdata.get("z3", [])
+        all_zones = pdata.get("z1",[]) + pdata.get("z2",[]) + pdata.get("z3",[]) + pdata.get("z4",[])
         if not all_zones:
             continue
 
@@ -1029,23 +1251,25 @@ def scan() -> list:
         z1 = s1_zones(df30, name)
         z2 = s2_zones(df30, name)
         z3 = s3_zones(df30, name)
-        has_zone   = bool(z1 or z2 or z3)
-        has_trade  = has_active_trade(name)
+        z4 = s4_zones(df30, name)  # Momentum + Fibonacci
+        has_zone  = bool(z1 or z2 or z3 or z4)
+        has_trade = has_active_trade(name)
 
         if has_zone or has_trade:
             reason = []
-            if z1: reason.append(f"S1:{len(z1)}zona")
-            if z2: reason.append(f"S2:{len(z2)}zona")
-            if z3: reason.append(f"S3:{len(z3)}zona")
-            if has_trade: reason.append("open_trade")
+            if z1: reason.append(f"S1:{len(z1)}")
+            if z2: reason.append(f"S2:{len(z2)}")
+            if z3: reason.append(f"S3:{len(z3)}")
+            if z4: reason.append(f"S4:{len(z4)}")
+            if has_trade: reason.append("trade")
             log.info(f"  {name}: AKTIF ({', '.join(reason)}) → fetch TF5+TF1")
             pairs_with_zones.append({
                 "asset": asset, "df30": df30,
-                "z1": z1, "z2": z2, "z3": z3,
+                "z1": z1, "z2": z2, "z3": z3, "z4": z4,
                 "has_trade": has_trade,
             })
         else:
-            log.info(f"  {name}: tidak ada zona → SKIP (hemat 2 request)")
+            log.info(f"  {name}: tidak ada zona → SKIP")
 
     if not pairs_with_zones:
         log.info("  Tidak ada pair aktif. Scan selesai. Credit dipakai: 1 request.")
@@ -1123,6 +1347,7 @@ def scan() -> list:
         send_sig(s1_entry(name, pdata["z1"], df5, df1), "S1")
         send_sig(s2_entry(name, pdata["z2"], df5, df1), "S2")
         send_sig(s3_entry(name, pdata["z3"], df5, df1), "S3")
+        send_sig(s4_entry(name, pdata["z4"], df5, df1), "S4")
 
     # Monitor open trade (pakai price cache, tidak request baru)
     monitor()
@@ -1179,10 +1404,11 @@ def run():
     init_db()
     send_tg("🤖 <b>Forex Signal Bot AKTIF</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "💱 EURUSD | GBPUSD | USDJPY | XAUUSD | BTCUSD\n"
+            "💱 EURUSD | XAUUSD | BTCUSD\n"
             "🎯 S1: Imbalance+Fractal+EMA21/50\n"
             "🎯 S2: S&D RBR/DBR/DBD/RBD\n"
             "🎯 S3: Momentum Pullback+OB+PA\n"
+            "🎯 S4: Momentum+Fibonacci Equilibrium\n"
             f"📐 RR: 1:{RR_RATIO} | Spread: {SPREAD_PIPS}pips fixed\n"
             f"💸 Risk: ${RISK_PER_TRADE_USD}/trade | Saldo: ${ACCOUNT_BALANCE}\n"
             "📦 Signal = LIMIT ORDER, bukan market order.\n"
